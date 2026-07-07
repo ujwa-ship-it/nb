@@ -2,6 +2,7 @@ import os, re, hashlib, secrets, json, asyncio
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, Depends, Response
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from pyrogram import Client, errors
 from dotenv import load_dotenv
@@ -10,6 +11,15 @@ from bson import ObjectId
 load_dotenv()
 
 web = FastAPI()
+
+web.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allows all frontend domains to access the API
+    allow_credentials=True,
+    allow_methods=["*"], # Allows GET, POST, PUT, DELETE, etc.
+    allow_headers=["*"], # Allows Authorization headers (Bearer tokens)
+)
+
 mongo = MongoClient(os.getenv("MONGO_URL"))
 db = mongo.nexstream
 videos_col = db.videos
