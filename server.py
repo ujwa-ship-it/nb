@@ -146,7 +146,6 @@ async def get_movie(vid: str):
     d["id"] = str(d["_id"])
     d["thumb_url"] = f"https://nb-y8c4.onrender.com/api/thumb/{d.get('thumb_file_id','')}" if d.get('thumb_file_id') else ""
     del d["_id"]
-    # 不要把file_id发给前端，只给stream URL
     d["stream_url"] = f"/api/stream/{vid}"
     return d
 
@@ -281,11 +280,16 @@ async def get_history(user=Depends(auth)):
 
 @web.post("/api/user/history/{vid}")
 async def add_history(vid: str, user=Depends(auth)):
-    # 最多保留200条历史
-    users_col.update_one({"_id": user["_id"]}, {
-        "$addToSet": {"history": vid},
-        "$set": {"history": user.get("history", [])[-199:] + [vid]}
-    })
+    history = user.get("history", [])
+    if vid in history:
+        history.remove(vid)
+    history.append(vid)
+    history = history[-200:] # Slice to keep the latest 200 items
+    
+    users_col.update_one(
+        {"_id": user["_id"]}, 
+        {"$set": {"history": history}}
+    )
     return {"ok": True}
 
 # ========== HEALTH ==========
