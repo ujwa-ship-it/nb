@@ -121,7 +121,7 @@ async def get_movies(page: int = 1, limit: int = 20, genre: str = ""):
     docs = list(videos_col.find(q).sort("date", -1).skip((page-1)*limit).limit(limit))
     for d in docs:
         d["id"] = str(d["_id"])
-        d["thumb_url"] = f"/api/thumb/{d.get('thumb_file_id','')}" if d.get('thumb_file_id') else ""
+        d["thumb_url"] = f"https://nb-y8c4.onrender.com/api/thumb/{d.get('thumb_file_id','')}" if d.get('thumb_file_id') else ""
         del d["_id"]
     return {"total": total, "page": page, "data": docs}
 
@@ -134,7 +134,7 @@ async def get_games(page: int = 1, limit: int = 20, genre: str = ""):
     docs = list(videos_col.find(q).sort("date", -1).skip((page-1)*limit).limit(limit))
     for d in docs:
         d["id"] = str(d["_id"])
-        d["thumb_url"] = f"/api/thumb/{d.get('thumb_file_id','')}" if d.get('thumb_file_id') else ""
+        d["thumb_url"] = f"https://nb-y8c4.onrender.com/api/thumb/{d.get('thumb_file_id','')}" if d.get('thumb_file_id') else ""
         del d["_id"]
     return {"total": total, "page": page, "data": docs}
 
@@ -144,7 +144,7 @@ async def get_movie(vid: str):
     if not d:
         raise HTTPException(404, "Not found")
     d["id"] = str(d["_id"])
-    d["thumb_url"] = f"/api/thumb/{d.get('thumb_file_id','')}" if d.get('thumb_file_id') else ""
+    d["thumb_url"] = f"https://nb-y8c4.onrender.com/api/thumb/{d.get('thumb_file_id','')}" if d.get('thumb_file_id') else ""
     del d["_id"]
     # 不要把file_id发给前端，只给stream URL
     d["stream_url"] = f"/api/stream/{vid}"
@@ -233,7 +233,7 @@ async def search(q: str = "", page: int = 1, limit: int = 20):
     docs = list(videos_col.find(q2).sort("date", -1).skip((page-1)*limit).limit(limit))
     for d in docs:
         d["id"] = str(d["_id"])
-        d["thumb_url"] = f"/api/thumb/{d.get('thumb_file_id','')}" if d.get('thumb_file_id') else ""
+        d["thumb_url"] = f"https://nb-y8c4.onrender.com/api/thumb/{d.get('thumb_file_id','')}" if d.get('thumb_file_id') else ""
         del d["_id"]
     return {"total": total, "page": page, "data": docs}
 
