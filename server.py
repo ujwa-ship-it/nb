@@ -31,10 +31,19 @@ log = logging.getLogger("nexstream")
 # -------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------
-MONGO_URL = os.getenv("MONGO_URL")
+# -------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------
+def _get_env_or_raise(key):
+    value = os.getenv(key)
+    if value is None:
+        raise SystemExit(f"❌ Missing required environment variable: {key}")
+    return value
+
+MONGO_URL = _get_env_or_raise("MONGO_URL")
 BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
+TELEGRAM_API_ID = int(_get_env_or_raise("TELEGRAM_API_ID"))
+TELEGRAM_API_HASH = _get_env_or_raise("TELEGRAM_API_HASH")
 
 STREAM_SECRET = os.getenv("STREAM_SECRET")
 if not STREAM_SECRET:
