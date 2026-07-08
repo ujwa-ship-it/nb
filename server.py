@@ -18,7 +18,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client
 from bson import ObjectId
 from bson.errors import InvalidId
-from passlib.hash import bcrypt
+import bcrypt
 from dotenv import load_dotenv
 
 load_dotenv()
