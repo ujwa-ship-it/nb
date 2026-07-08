@@ -201,21 +201,28 @@ async def register(data: dict):
         raise HTTPException(400, "Invalid input")
     if await users_col.find_one({"email": email}):
         raise HTTPException(400, "Email already exists")
+    
     token = secrets.token_hex(32)
     hashed = hash_pw(pw)
     expires = datetime.now(timezone.utc) + timedelta(days=30)
-    await users_col.insert_one({
-        "name": name,
-        "email": email,
-        "password": hashed,
-        "token": token,
-        "expires_at": expires,
-        "my_list": [],
-        "history": [],
-        "created_at": datetime.now(timezone.utc)
-    })
+    
+    # Wrap the database insert in a try/except
+    try:
+        await users_col.insert_one({
+            "name": name,
+            "email": email,
+            "password": hashed,
+            "token": token,
+            "expires_at": expires,
+            "my_list": [],
+            "history": [],
+            "created_at": datetime.now(timezone.utc)
+        })
+    except DuplicateKeyError:
+        raise HTTPException(400, "Email already exists") # Catch the crash safely!
+        
     return {"token": token, "name": name, "email": email}
-
+    
 @web.post("/api/auth/login")
 async def login(data: dict):
     email = str(data.get("email", "")).strip().lower()
