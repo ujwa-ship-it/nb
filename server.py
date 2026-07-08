@@ -308,8 +308,8 @@ async def stream_video(vid: str, request: Request, user=Depends(auth)):
             raise HTTPException(416, "Range not satisfiable")
         length = end - start + 1
         chunk_offset = start // CHUNK
-        chunk_limit = math.ceil((length + discard) / CHUNK)
         discard = start % CHUNK   # bytes to skip from the first chunk
+        chunk_limit = math.ceil((length + discard) / CHUNK)
 
         async def gen():
             sent = 0
@@ -422,8 +422,8 @@ async def watch_hashed(
             raise HTTPException(416)
         length = end - start + 1
         chunk_offset = start // CHUNK
+        discard = start % CHUNK   # bytes to skip from the first chunk
         chunk_limit = math.ceil((length + discard) / CHUNK)
-        discard = start % CHUNK
 
         async def gen():
             sent = 0
