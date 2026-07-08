@@ -6,6 +6,7 @@ import secrets
 import time
 import asyncio
 import logging
+from pymongo.errors import DuplicateKeyError
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional
