@@ -105,10 +105,12 @@ def validate_object_id(vid: str) -> ObjectId:
         raise HTTPException(404, "Not found")
 
 def hash_pw(pw: str) -> str:
-    return bcrypt.hash(pw)
+    # bcrypt requires bytes, so we encode the string, then decode the result back to string
+    return bcrypt.hashpw(pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def verify_pw(pw: str, hashed: str) -> bool:
-    return bcrypt.verify(pw, hashed)
+    # Check password against the hashed string
+    return bcrypt.checkpw(pw.encode('utf-8'), hashed.encode('utf-8'))
 
 def is_valid_email(email: str) -> bool:
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
