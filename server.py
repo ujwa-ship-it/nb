@@ -73,12 +73,14 @@ async def get_pyro():
             if not session_data or not session_data.get("string"):
                 raise HTTPException(500, "No Telegram session. Run sync.py first.")
 
+            # Clean up dead client if it exists
             if pyro is not None:
                 try:
                     await pyro.stop()
                 except Exception:
                     pass
 
+            # Create a fresh client
             pyro = Client(
                 "render",
                 api_id=TELEGRAM_API_ID,
@@ -177,8 +179,9 @@ async def ensure_indexes():
 def format_video_doc(d: dict) -> dict:
     if d is None:
         return None
-    d = dict(d) 
+    d = dict(d)
     d["id"] = str(d.pop("_id"))
+    # Always append api/thumb if file_id exists, frontend will handle local prepends
     d["thumb_url"] = d.get("thumb_url") or (
         f"{BASE_URL}/api/thumb/{d['thumb_file_id']}" if d.get("thumb_file_id") else ""
     )
@@ -194,6 +197,8 @@ async def register(data: dict):
     pw = str(data.get("password", ""))
     if not name or not is_valid_email(email) or len(pw) < 6:
         raise HTTPException(400, "Invalid input")
+    if await users_col.find_one({"email": email}):
+        raise HTTPException(400, "Email already exists")
     
     token = secrets.token_hex(32)
     hashed = hash_pw(pw)
@@ -302,14 +307,8 @@ async def stream_video(vid: str, request: Request, user=Depends(auth)):
     doc = await videos_col.find_one({"_id": oid})
     if not doc:
         raise HTTPException(404, "Not found")
-    
     file_size = doc["file_size"]
     p = await get_pyro()
-
-    # CRITICAL FIX: Fetch fresh message to prevent FILE_REFERENCE_EXPIRED
-    msg = await p.get_messages(doc["channel_id"], doc["message_id"])
-    if getattr(msg, "empty", False):
-        raise HTTPException(404, "Video deleted from Telegram")
 
     range_header = request.headers.get("range")
     if range_header:
@@ -329,9 +328,9 @@ async def stream_video(vid: str, request: Request, user=Depends(auth)):
         async def gen():
             sent = 0
             try:
-                # Pass msg object instead of tuple
+                # FIXED: Pyrogram requires a message object or string file_id, not a tuple
                 async for chunk in p.stream_media(
-                    message=msg,
+                    doc["file_id"],
                     offset=chunk_offset,
                     limit=chunk_limit,
                 ):
@@ -361,7 +360,8 @@ async def stream_video(vid: str, request: Request, user=Depends(auth)):
     else:
         async def gen_full():
             try:
-                async for chunk in p.stream_media(message=msg):
+                # FIXED: Pyrogram requires a string file_id
+                async for chunk in p.stream_media(doc["file_id"]):
                     yield chunk
             except Exception as e:
                 log.error("full stream error: %s", e)
@@ -400,7 +400,7 @@ async def watch_hashed(
     message_id: int,
     file_unique_id: str,
     request: Request,
-    sig_hash: str = Query("", alias="hash"), 
+    sig_hash: str = Query("", alias="hash"),
 ):
     doc = await videos_col.find_one({
         "message_id": message_id,
@@ -409,28 +409,22 @@ async def watch_hashed(
     if not doc:
         raise HTTPException(404)
 
-    # Secure verification
     try:
         expiry = int(sig_hash[8:]) if len(sig_hash) > 8 else 0
         sig = sig_hash[:8]
         raw = f"{str(doc['_id'])}:{expiry}"
         expected = hmac.new(STREAM_SECRET.encode(), raw.encode(), "sha256").hexdigest()[:8]
-        if not hmac.compare_digest(sig, expected) or time.time() > expiry:
+        if sig != expected or time.time() > expiry:
             raise HTTPException(403, "Invalid or expired link")
     except HTTPException:
-        raise
+        raise               
     except Exception:
-        raise HTTPException(403, "Invalid hash")
+        raise HTTPException(403, "Invalid hash") 
 
     file_size = doc["file_size"]
     p = await get_pyro()
-    
-    # CRITICAL FIX: Fetch fresh message here as well
-    msg = await p.get_messages(doc["channel_id"], doc["message_id"])
-    if getattr(msg, "empty", False):
-        raise HTTPException(404, "Video deleted from Telegram")
-
     range_header = request.headers.get("range")
+    
     if range_header:
         m = re.match(r"bytes=(\d+)-(\d*)", range_header)
         if not m:
@@ -448,8 +442,9 @@ async def watch_hashed(
         async def gen():
             sent = 0
             try:
+                # FIXED: Pyrogram requires a string file_id
                 async for chunk in p.stream_media(
-                    message=msg,
+                    doc["file_id"],
                     offset=chunk_offset,
                     limit=chunk_limit,
                 ):
@@ -478,7 +473,8 @@ async def watch_hashed(
     else:
         async def gen_full():
             try:
-                async for chunk in p.stream_media(message=msg):
+                # FIXED: Pyrogram requires a string file_id
+                async for chunk in p.stream_media(doc["file_id"]):
                     yield chunk
             except Exception as e:
                 log.error("hashed full stream error: %s", e)
