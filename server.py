@@ -32,9 +32,6 @@ log = logging.getLogger("nexstream")
 # -------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------
-# -------------------------------------------------------------------
-# Configuration
-# -------------------------------------------------------------------
 def _get_env_or_raise(key):
     value = os.getenv(key)
     if value is None:
@@ -76,14 +73,12 @@ async def get_pyro():
             if not session_data or not session_data.get("string"):
                 raise HTTPException(500, "No Telegram session. Run sync.py first.")
 
-            # Clean up dead client if it exists
             if pyro is not None:
                 try:
                     await pyro.stop()
                 except Exception:
                     pass
 
-            # Create a fresh client
             pyro = Client(
                 "render",
                 api_id=TELEGRAM_API_ID,
@@ -105,11 +100,9 @@ def validate_object_id(vid: str) -> ObjectId:
         raise HTTPException(404, "Not found")
 
 def hash_pw(pw: str) -> str:
-    # bcrypt requires bytes, so we encode the string, then decode the result back to string
     return bcrypt.hashpw(pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def verify_pw(pw: str, hashed: str) -> bool:
-    # Check password against the hashed string
     return bcrypt.checkpw(pw.encode('utf-8'), hashed.encode('utf-8'))
 
 def is_valid_email(email: str) -> bool:
@@ -140,7 +133,7 @@ async def auth(request: Request):
     return user
 
 # -------------------------------------------------------------------
-# CORS & Lifespan (FastAPI initialised ONCE)
+# CORS & Lifespan
 # -------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -179,12 +172,12 @@ async def ensure_indexes():
         log.warning("Could not ensure indexes: %s", e)
 
 # -------------------------------------------------------------------
-# Format video doc (without mutating the original)
+# Format video doc
 # -------------------------------------------------------------------
 def format_video_doc(d: dict) -> dict:
     if d is None:
         return None
-    d = dict(d)  # shallow copy to avoid mutating DB cursor
+    d = dict(d) 
     d["id"] = str(d.pop("_id"))
     d["thumb_url"] = d.get("thumb_url") or (
         f"{BASE_URL}/api/thumb/{d['thumb_file_id']}" if d.get("thumb_file_id") else ""
@@ -201,14 +194,11 @@ async def register(data: dict):
     pw = str(data.get("password", ""))
     if not name or not is_valid_email(email) or len(pw) < 6:
         raise HTTPException(400, "Invalid input")
-    if await users_col.find_one({"email": email}):
-        raise HTTPException(400, "Email already exists")
     
     token = secrets.token_hex(32)
     hashed = hash_pw(pw)
     expires = datetime.now(timezone.utc) + timedelta(days=30)
     
-    # Wrap the database insert in a try/except
     try:
         await users_col.insert_one({
             "name": name,
@@ -221,7 +211,7 @@ async def register(data: dict):
             "created_at": datetime.now(timezone.utc)
         })
     except DuplicateKeyError:
-        raise HTTPException(400, "Email already exists") # Catch the crash safely!
+        raise HTTPException(400, "Email already exists")
         
     return {"token": token, "name": name, "email": email}
     
@@ -312,8 +302,14 @@ async def stream_video(vid: str, request: Request, user=Depends(auth)):
     doc = await videos_col.find_one({"_id": oid})
     if not doc:
         raise HTTPException(404, "Not found")
+    
     file_size = doc["file_size"]
     p = await get_pyro()
+
+    # CRITICAL FIX: Fetch fresh message to prevent FILE_REFERENCE_EXPIRED
+    msg = await p.get_messages(doc["channel_id"], doc["message_id"])
+    if getattr(msg, "empty", False):
+        raise HTTPException(404, "Video deleted from Telegram")
 
     range_header = request.headers.get("range")
     if range_header:
@@ -327,14 +323,15 @@ async def stream_video(vid: str, request: Request, user=Depends(auth)):
             raise HTTPException(416, "Range not satisfiable")
         length = end - start + 1
         chunk_offset = start // CHUNK
-        discard = start % CHUNK   # bytes to skip from the first chunk
+        discard = start % CHUNK   
         chunk_limit = math.ceil((length + discard) / CHUNK)
 
         async def gen():
             sent = 0
             try:
+                # Pass msg object instead of tuple
                 async for chunk in p.stream_media(
-                    (doc["channel_id"], doc["message_id"]),
+                    message=msg,
                     offset=chunk_offset,
                     limit=chunk_limit,
                 ):
@@ -364,7 +361,7 @@ async def stream_video(vid: str, request: Request, user=Depends(auth)):
     else:
         async def gen_full():
             try:
-                async for chunk in p.stream_media((doc["channel_id"], doc["message_id"])):
+                async for chunk in p.stream_media(message=msg):
                     yield chunk
             except Exception as e:
                 log.error("full stream error: %s", e)
@@ -379,10 +376,9 @@ async def stream_video(vid: str, request: Request, user=Depends(auth)):
         )
 
 # -------------------------------------------------------------------
-# SIGNED WATCH-URL (like reference site)
+# SIGNED WATCH-URL
 # -------------------------------------------------------------------
 def generate_stream_token(vid: str) -> str:
-    """Create a time-limited token for a video (vid = string)."""
     expiry = int(time.time()) + 3600
     raw = f"{vid}:{expiry}"
     sig = hmac.new(STREAM_SECRET.encode(), raw.encode(), "sha256").hexdigest()[:8]
@@ -390,7 +386,6 @@ def generate_stream_token(vid: str) -> str:
 
 @web.get("/api/video/{vid}/watch-url")
 async def get_watch_url(vid: str, user=Depends(auth)):
-    """Generate a signed, auth-less URL for the video player."""
     oid = validate_object_id(vid)
     doc = await videos_col.find_one({"_id": oid}, {"message_id": 1, "file_unique_id": 1})
     if not doc:
@@ -405,7 +400,7 @@ async def watch_hashed(
     message_id: int,
     file_unique_id: str,
     request: Request,
-    sig_hash: str = Query("", alias="hash"),   # URL ?hash=... , Python var sig_hash
+    sig_hash: str = Query("", alias="hash"), 
 ):
     doc = await videos_col.find_one({
         "message_id": message_id,
@@ -414,21 +409,27 @@ async def watch_hashed(
     if not doc:
         raise HTTPException(404)
 
-    # Verify signature
+    # Secure verification
     try:
         expiry = int(sig_hash[8:]) if len(sig_hash) > 8 else 0
         sig = sig_hash[:8]
         raw = f"{str(doc['_id'])}:{expiry}"
         expected = hmac.new(STREAM_SECRET.encode(), raw.encode(), "sha256").hexdigest()[:8]
-        if sig != expected or time.time() > expiry:
+        if not hmac.compare_digest(sig, expected) or time.time() > expiry:
             raise HTTPException(403, "Invalid or expired link")
     except HTTPException:
-        raise               # let specific HTTP errors pass through untouched
+        raise
     except Exception:
-        raise HTTPException(403, "Invalid hash")  # catch math/string errors
+        raise HTTPException(403, "Invalid hash")
 
     file_size = doc["file_size"]
     p = await get_pyro()
+    
+    # CRITICAL FIX: Fetch fresh message here as well
+    msg = await p.get_messages(doc["channel_id"], doc["message_id"])
+    if getattr(msg, "empty", False):
+        raise HTTPException(404, "Video deleted from Telegram")
+
     range_header = request.headers.get("range")
     if range_header:
         m = re.match(r"bytes=(\d+)-(\d*)", range_header)
@@ -441,14 +442,14 @@ async def watch_hashed(
             raise HTTPException(416)
         length = end - start + 1
         chunk_offset = start // CHUNK
-        discard = start % CHUNK   # bytes to skip from the first chunk
+        discard = start % CHUNK   
         chunk_limit = math.ceil((length + discard) / CHUNK)
 
         async def gen():
             sent = 0
             try:
                 async for chunk in p.stream_media(
-                    (doc["channel_id"], doc["message_id"]),
+                    message=msg,
                     offset=chunk_offset,
                     limit=chunk_limit,
                 ):
@@ -477,7 +478,7 @@ async def watch_hashed(
     else:
         async def gen_full():
             try:
-                async for chunk in p.stream_media((doc["channel_id"], doc["message_id"])):
+                async for chunk in p.stream_media(message=msg):
                     yield chunk
             except Exception as e:
                 log.error("hashed full stream error: %s", e)
@@ -564,7 +565,6 @@ async def get_history(user: dict = Depends(auth)) -> list[dict]:
 @web.post("/api/user/history/{vid}")
 async def add_history(vid: str, user: dict = Depends(auth)) -> dict[str, bool]:
     validate_object_id(vid)
-    # Safe two-step: remove old occurrence, then push to end with slice
     await users_col.update_one({"_id": user["_id"]}, {"$pull": {"history": vid}})
     await users_col.update_one(
         {"_id": user["_id"]},
