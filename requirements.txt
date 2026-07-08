@@ -1,6 +1,10 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-pyrogram==2.0.106
-tgcrypto==1.2.5
-pymongo==4.8.0
-python-dotenv==1.0.1
+fastapi
+uvicorn[standard]
+pyrogram
+tgcrypto
+motor
+python-dotenv
+pillow
+telegraph
+python-multipart
+passlib[bcrypt]
