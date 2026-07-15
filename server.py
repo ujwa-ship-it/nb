@@ -409,7 +409,6 @@ async def _upsert_video(client: Client, message: Message):
     # Reject files larger than 2.0GB (Telegram non-premium limit)
     if media.file_size and media.file_size > MAX_FILE_SIZE_BYTES:
         log.warning(f"⚠️ Skipping '{media.file_name}': Size ({media.file_size / 1e9:.2f} GB) exceeds 2.0GB limit.")
-        # Delete from DB if it was previously saved somehow
         try:
             result = await videos_col.delete_one({"file_unique_id": media.file_unique_id})
             if result.deleted_count:
@@ -491,7 +490,6 @@ async def _cleanup_deleted_videos():
     while True:
         log.info("🧹 Starting periodic cleanup of deleted videos...")
         try:
-            # Group message IDs by channel for batch fetching
             pipeline = [
                 {"$group": {"_id": "$channel_id", "msg_ids": {"$push": "$message_id"}}}
             ]
@@ -509,7 +507,6 @@ async def _cleanup_deleted_videos():
                 if not ch_id or not msg_ids:
                     continue
                     
-                # Telegram allows fetching 100 messages per request
                 for i in range(0, len(msg_ids), 100):
                     batch = msg_ids[i:i+100]
                     try:
@@ -518,7 +515,6 @@ async def _cleanup_deleted_videos():
                         deleted_ids = set(batch) - existing_ids
                         
                         if deleted_ids:
-                            # Fetch docs to invalidate cache before deleting
                             del_docs = await videos_col.find(
                                 {"channel_id": ch_id, "message_id": {"$in": list(deleted_ids)}},
                                 {"_id": 1, "message_id": 1, "file_unique_id": 1}
@@ -636,11 +632,21 @@ async def _backfill_access_hashes():
 
 
 # ===================================================================
-# Lifespan
+# Lifespan & Custom Exception Handler
 # ===================================================================
+def _suppress_pyrogram_peer_errors(loop, context):
+    """Silence Pyrogram's 'Peer id invalid' errors caused by in_memory sessions."""
+    exc = context.get("exception")
+    if isinstance(exc, ValueError) and "Peer id invalid" in str(exc):
+        return
+    loop.default_exception_handler(context)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global stream_client, bot_app
+
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_suppress_pyrogram_peer_errors)
 
     bot_app = Client(
         "nexstream_bot",
@@ -685,8 +691,6 @@ async def lifespan(app: FastAPI):
     await ensure_indexes()
     asyncio.create_task(_force_resolve_channels())
     asyncio.create_task(_backfill_access_hashes())
-    
-    # Start periodic cleanup task to remove deleted videos from DB
     asyncio.create_task(_cleanup_deleted_videos())
 
     log.info("NexStream API + Sync Bot initialized.")
@@ -975,7 +979,6 @@ async def _fetch_message_fresh(doc: dict):
     if not channel_id or not message_id:
         raise HTTPException(400, "Missing channel_id or message_id")
 
-    # Tier 1: Direct fetch
     try:
         msg = await fetch_client.get_messages(channel_id, message_id)
         if msg and not getattr(msg, "empty", False):
@@ -989,7 +992,6 @@ async def _fetch_message_fresh(doc: dict):
         else:
             log.error(f"get_messages failed (tier 1): {e}")
 
-    # Tier 2: get_chat to wake cache
     log.info(f"Tier 2: get_chat to wake cache for channel {channel_id}...")
     try:
         await fetch_client.get_chat(channel_id)
@@ -1005,7 +1007,6 @@ async def _fetch_message_fresh(doc: dict):
     except Exception as e:
         log.warning(f"Tier 2 failed for channel {channel_id}: {e}")
 
-    # Tier 3: Raw MTProto
     access_hash = doc.get("channel_access_hash")
     if access_hash is None:
         access_hash = await _get_access_hash_from_db(channel_id)
@@ -1140,7 +1141,7 @@ async def build_stream_response(
     if length > 0:
         chunk_limit = math.ceil((length + discard) / CHUNK_SIZE)
     else:
-        chunk_limit = 0  # 0 means unlimited in Pyrogram's stream_media
+        chunk_limit = 0
 
     filename = custom_filename or file_info["file_name"]
     if not filename:
@@ -1470,7 +1471,7 @@ async def get_vlc_playlist(vid: str):
 
 
 # ===================================================================
-# THUMBNAILS
+# THUMBNAILS (Optimized direct fetch)
 # ===================================================================
 @web.get("/api/thumb/{vid}")
 async def get_thumb(vid: str):
@@ -1487,51 +1488,22 @@ async def get_thumb(vid: str):
         raise HTTPException(503, "Thumbnail service not available")
 
     doc = await _get_video_by_id(oid)
-    if not doc:
-        raise HTTPException(404, "Not found")
-
-    if doc.get("thumb_file_id") is None:
+    if not doc or not doc.get("thumb_file_id"):
         raise HTTPException(404, "No thumbnail available")
 
+    thumb_file_id = doc["thumb_file_id"]
+
     try:
-        msg = await _fetch_message_fresh(doc)
-    except HTTPException:
-        raise
+        # Download thumbnail directly into RAM using Pyrogram
+        data = await bot_app.download_media(thumb_file_id, in_memory=True)
+        if data:
+            content = data.read() if hasattr(data, 'read') else bytes(data)
+            await thumb_cache.set(vid, content)
+            return Response(content=content, media_type="image/jpeg")
     except Exception as e:
-        log.error(f"Thumbnail fetch failed: {e}")
-        raise HTTPException(503, "Thumbnail unavailable")
+        log.error(f"Thumbnail download error: {e}")
 
-    thumb_file_id = None
-    media = msg.video or msg.document
-    if media and hasattr(media, "thumbs") and media.thumbs:
-        try:
-            thumb_file_id = max(media.thumbs, key=lambda t: t.width or 0).file_id
-        except (ValueError, AttributeError):
-            pass
-    if not thumb_file_id:
-        try:
-            await videos_col.update_one({"_id": oid}, {"$set": {"thumb_file_id": None}})
-            await _invalidate_video_cache(oid, doc.get("message_id"), doc.get("file_unique_id"))
-        except: pass
-        raise HTTPException(404, "No thumbnail available")
-
-    try:
-        await videos_col.update_one({"_id": oid}, {"$set": {"thumb_file_id": thumb_file_id}})
-    except Exception:
-        pass
-
-    async def stream_thumb():
-        buffer = io.BytesIO()
-        try:
-            async for chunk in bot_app.stream_media(thumb_file_id):
-                if chunk:
-                    buffer.write(chunk)
-                    yield chunk
-            await thumb_cache.set(vid, buffer.getvalue())
-        except Exception as e:
-            log.error(f"Thumbnail stream error: {e}")
-
-    return StreamingResponse(stream_thumb(), media_type="image/jpeg")
+    raise HTTPException(404, "No thumbnail available")
 
 
 # ===================================================================
