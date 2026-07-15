@@ -814,6 +814,16 @@ def _get_stream_client() -> Client:
         return bot_app
     raise HTTPException(503, "Streaming service not available")
 
+# ===================================================================
+# THUMBNAIL CLIENT HELPER (Prioritizes User Session)
+# ===================================================================
+def _get_thumb_client() -> Client:
+    if stream_client is not None and _clients_started["stream"]:
+        return stream_client
+    if bot_app is not None and _clients_started["bot"]:
+        return bot_app
+    raise HTTPException(503, "Thumbnail service not available")
+
 
 # ===================================================================
 # AUTH ROUTES
@@ -1031,7 +1041,7 @@ async def _fetch_message_fresh(doc: dict):
             access_hash=access_hash,
         )
         r = await fetch_client.invoke(
-            raw_functions.channels.GetMessages(
+            raw_functions.Channels.GetMessages(
                 channel=input_channel,
                 id=[raw_types.InputMessageID(id=message_id)],
             )
@@ -1471,7 +1481,7 @@ async def get_vlc_playlist(vid: str):
 
 
 # ===================================================================
-# THUMBNAILS (Optimized direct fetch)
+# THUMBNAILS (Optimized & Fixed)
 # ===================================================================
 @web.get("/api/thumb/{vid}")
 async def get_thumb(vid: str):
@@ -1480,28 +1490,52 @@ async def get_thumb(vid: str):
     except (InvalidId, TypeError):
         raise HTTPException(404, "Not found")
 
+    # 1. Check cache
     cached = thumb_cache.get(vid)
     if cached:
         return Response(content=cached, media_type="image/jpeg")
 
-    if bot_app is None or not _clients_started["bot"]:
-        raise HTTPException(503, "Thumbnail service not available")
-
     doc = await _get_video_by_id(oid)
-    if not doc or not doc.get("thumb_file_id"):
-        raise HTTPException(404, "No thumbnail available")
+    if not doc:
+        raise HTTPException(404, "Not found")
 
-    thumb_file_id = doc["thumb_file_id"]
+    # Select the best client (Prefers User Session)
+    client = _get_thumb_client()
 
+    # 2. Fast path: Try downloading using the stored thumb_file_id
+    thumb_file_id = doc.get("thumb_file_id")
+    if thumb_file_id:
+        try:
+            data = await client.download_media(thumb_file_id, in_memory=True)
+            if data:
+                content = data.read() if hasattr(data, 'read') else bytes(data)
+                if content:
+                    await thumb_cache.set(vid, content)
+                    return Response(content=content, media_type="image/jpeg")
+        except Exception as e:
+            log.warning(f"Thumbnail download via stored file_id failed: {e}")
+
+    # 3. Fallback: Fetch message fresh (handles PeerIdInvalid and FileReferenceExpired)
     try:
-        # Download thumbnail directly into RAM using Pyrogram
-        data = await bot_app.download_media(thumb_file_id, in_memory=True)
-        if data:
-            content = data.read() if hasattr(data, 'read') else bytes(data)
-            await thumb_cache.set(vid, content)
-            return Response(content=content, media_type="image/jpeg")
+        msg = await _fetch_message_fresh(doc)
+        media = msg.video or msg.document
+        if media and hasattr(media, 'thumbs') and media.thumbs:
+            # Pick the best/highest resolution thumbnail
+            best_thumb = max(media.thumbs, key=lambda t: t.width or 0)
+            
+            data = await client.download_media(best_thumb, in_memory=True)
+            if data:
+                content = data.read() if hasattr(data, 'read') else bytes(data)
+                if content:
+                    # Update DB with the fresh thumb_file_id so future requests are fast
+                    await videos_col.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"thumb_file_id": best_thumb.file_id}}
+                    )
+                    await thumb_cache.set(vid, content)
+                    return Response(content=content, media_type="image/jpeg")
     except Exception as e:
-        log.error(f"Thumbnail download error: {e}")
+        log.error(f"Thumbnail fallback fetch failed: {e}")
 
     raise HTTPException(404, "No thumbnail available")
 
