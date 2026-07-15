@@ -95,6 +95,9 @@ MAX_THUMB_CACHE        = int(os.getenv("MAX_THUMB_CACHE", "100"))
 MAX_DOC_CACHE          = int(os.getenv("MAX_DOC_CACHE", "100"))
 READAHEAD_CHUNKS       = int(os.getenv("READAHEAD_CHUNKS", "1"))
 
+# Telegram strictly limits non-premium downloads to 2.0 GB
+MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024
+
 # ===================================================================
 # Database
 # ===================================================================
@@ -102,7 +105,7 @@ mongo = AsyncIOMotorClient(MONGO_URL, tz_aware=True, serverSelectionTimeoutMS=10
 db = mongo.nexstream
 videos_col     = db.videos
 users_col      = db.users
-channel_hashes = db.channel_hashes          # dedicated collection for access_hash
+channel_hashes = db.channel_hashes
 
 # ===================================================================
 # MTProto Clients
@@ -117,8 +120,6 @@ _stream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
 # Caches
 # ===================================================================
 class BoundedCache:
-    """Simple bounded cache for thumbnail bytes (FIFO eviction)."""
-
     def __init__(self, max_size: int = MAX_THUMB_CACHE):
         self._max = max_size
         self._data: dict[str, bytes] = {}
@@ -136,10 +137,12 @@ class BoundedCache:
                 oldest = next(iter(self._data))
                 self._data.pop(oldest, None)
 
+    async def invalidate(self, key: str):
+        async with self._lock:
+            self._data.pop(key, None)
+
 
 class LRUCache:
-    """True LRU cache for MongoDB document lookups."""
-
     def __init__(self, max_size: int = MAX_DOC_CACHE):
         self._max = max_size
         self._data: OrderedDict = OrderedDict()
@@ -251,10 +254,9 @@ async def auth(request: Request) -> dict:
 
 
 # ===================================================================
-# Cached Video Lookups  (LRU DocCache for speed)
+# Cached Video Lookups
 # ===================================================================
 async def _get_video_by_id(oid: ObjectId) -> Optional[dict]:
-    """Fetch video by _id with LRU caching. Returns a shallow copy."""
     key = f"id:{oid}"
     cached = doc_cache.get(key)
     if cached is not None:
@@ -267,7 +269,6 @@ async def _get_video_by_id(oid: ObjectId) -> Optional[dict]:
 
 
 async def _get_video_by_message(message_id: int, file_unique_id: str) -> Optional[dict]:
-    """Fetch video by (message_id, file_unique_id) with LRU caching."""
     key = f"msg:{message_id}:{file_unique_id}"
     cached = doc_cache.get(key)
     if cached is not None:
@@ -293,10 +294,9 @@ async def _invalidate_video_cache(
 
 
 # ===================================================================
-# Access-Hash Helpers  (fixes PeerIdInvalid on redeploy)
+# Access-Hash Helpers
 # ===================================================================
 async def _save_access_hash(channel_id: int, access_hash: int):
-    """Persist access_hash to both channel_hashes collection and video docs."""
     try:
         await channel_hashes.update_one(
             {"channel_id": channel_id},
@@ -316,15 +316,12 @@ async def _save_access_hash(channel_id: int, access_hash: int):
 
 
 async def _get_access_hash_from_db(channel_id: int) -> Optional[int]:
-    """Retrieve access_hash from MongoDB (channel_hashes → video docs)."""
-    # 1. Try the dedicated collection
     try:
         ch_doc = await channel_hashes.find_one({"channel_id": channel_id})
         if ch_doc and ch_doc.get("access_hash") is not None:
             return ch_doc["access_hash"]
     except Exception:
         pass
-    # 2. Fallback: any video doc that already has it
     try:
         v_doc = await videos_col.find_one(
             {"channel_id": channel_id,
@@ -409,6 +406,18 @@ async def _upsert_video(client: Client, message: Message):
     if not is_video:
         return
 
+    # Reject files larger than 2.0GB (Telegram non-premium limit)
+    if media.file_size and media.file_size > MAX_FILE_SIZE_BYTES:
+        log.warning(f"⚠️ Skipping '{media.file_name}': Size ({media.file_size / 1e9:.2f} GB) exceeds 2.0GB limit.")
+        # Delete from DB if it was previously saved somehow
+        try:
+            result = await videos_col.delete_one({"file_unique_id": media.file_unique_id})
+            if result.deleted_count:
+                log.info(f"🧹 Removed oversized video '{media.file_unique_id}' from DB.")
+        except Exception:
+            pass
+        return
+
     doc = _build_doc(message)
 
     try:
@@ -434,7 +443,6 @@ async def _upsert_video(client: Client, message: Message):
 
 
 def _register_sync_handlers(client: Client):
-    """Register sync handlers on the given Pyrogram client."""
     if not CHANNELS:
         log.warning("⚠️  SYNC_CHANNELS not set — sync handlers disabled.")
         return
@@ -474,20 +482,74 @@ def _register_sync_handlers(client: Client):
 
 
 # ===================================================================
-# Force-Resolve Channels at Startup  (fixes PeerIdInvalid on redeploy)
+# Background Cleanup (Periodic Deletion Check)
+# ===================================================================
+async def _cleanup_deleted_videos():
+    """Periodically checks if videos in MongoDB still exist in the channel.
+    If deleted, removes them from MongoDB. Runs every 6 hours."""
+    await asyncio.sleep(60)  # Wait 1 min after startup before first run
+    while True:
+        log.info("🧹 Starting periodic cleanup of deleted videos...")
+        try:
+            # Group message IDs by channel for batch fetching
+            pipeline = [
+                {"$group": {"_id": "$channel_id", "msg_ids": {"$push": "$message_id"}}}
+            ]
+            channels_data = await videos_col.aggregate(pipeline).to_list(length=None)
+            
+            client = stream_client if _clients_started.get("stream") else bot_app
+            if not client:
+                log.warning("Skipping cleanup: No active MTProto client.")
+                await asyncio.sleep(21600)
+                continue
+                
+            for ch_data in channels_data:
+                ch_id = ch_data["_id"]
+                msg_ids = ch_data["msg_ids"]
+                if not ch_id or not msg_ids:
+                    continue
+                    
+                # Telegram allows fetching 100 messages per request
+                for i in range(0, len(msg_ids), 100):
+                    batch = msg_ids[i:i+100]
+                    try:
+                        msgs = await client.get_messages(ch_id, batch)
+                        existing_ids = {m.id for m in msgs if m and not getattr(m, "empty", False)}
+                        deleted_ids = set(batch) - existing_ids
+                        
+                        if deleted_ids:
+                            # Fetch docs to invalidate cache before deleting
+                            del_docs = await videos_col.find(
+                                {"channel_id": ch_id, "message_id": {"$in": list(deleted_ids)}},
+                                {"_id": 1, "message_id": 1, "file_unique_id": 1}
+                            ).to_list(length=len(deleted_ids))
+                            
+                            for d in del_docs:
+                                await _invalidate_video_cache(d["_id"], d["message_id"], d.get("file_unique_id"))
+                                
+                            result = await videos_col.delete_many(
+                                {"channel_id": ch_id, "message_id": {"$in": list(deleted_ids)}}
+                            )
+                            if result.deleted_count:
+                                log.info(f"🧹 Purged {result.deleted_count} deleted video(s) from channel {ch_id}")
+                    except Exception as e:
+                        log.warning(f"Cleanup batch failed for channel {ch_id}: {e}")
+                        continue
+                        
+        except Exception as e:
+            log.error(f"Cleanup task error: {e}")
+            
+        await asyncio.sleep(21600)  # Sleep for 6 hours
+
+
+# ===================================================================
+# Force-Resolve Channels at Startup
 # ===================================================================
 async def _force_resolve_channels():
-    """Force-resolve all SYNC_CHANNELS, waiting for Pyrogram's background
-    peer-cache sync, and persist access_hash to MongoDB.
-
-    Retries up to 5 times per channel with a 3-second sleep between attempts.
-    """
     if not CHANNELS:
         return
 
     log.info(f"🔒 Force-resolving {len(CHANNELS)} sync channel(s)...")
-
-    # Give Pyrogram a moment to sync peers in the background
     await asyncio.sleep(3)
 
     for channel_id in CHANNELS:
@@ -507,55 +569,38 @@ async def _force_resolve_channels():
                         resolved = True
                         break
                 except Exception as e:
-                    log.debug(
-                        f"  resolve_peer attempt {attempt + 1} for "
-                        f"{channel_id} via {client_name}: {e}"
-                    )
+                    log.debug(f"  resolve_peer attempt {attempt + 1} for {channel_id} via {client_name}: {e}")
             if resolved:
                 break
 
-            # Wake up Pyrogram's peer cache with get_chat
             for client_name, client in [("bot", bot_app), ("stream", stream_client)]:
                 if client is None or not _clients_started.get(client_name):
                     continue
                 try:
                     await client.get_chat(channel_id)
-                    # Try resolve again right after get_chat
                     try:
                         peer = await client.resolve_peer(channel_id)
                         if hasattr(peer, "access_hash") and peer.access_hash:
                             await _save_access_hash(channel_id, peer.access_hash)
-                            log.info(
-                                f"  ✅ Resolved {channel_id} via {client_name} "
-                                f"after get_chat (attempt {attempt + 1})"
-                            )
+                            log.info(f"  ✅ Resolved {channel_id} via {client_name} after get_chat")
                             resolved = True
                             break
                     except Exception:
                         pass
                 except Exception as e:
-                    log.debug(
-                        f"  get_chat for {channel_id} via {client_name}: {e}"
-                    )
+                    log.debug(f"  get_chat for {channel_id} via {client_name}: {e}")
             if resolved:
                 break
 
             if attempt < 4:
-                log.info(
-                    f"  ⏳ Retrying channel {channel_id} "
-                    f"(attempt {attempt + 1}/5)..."
-                )
+                log.info(f"  ⏳ Retrying channel {channel_id} (attempt {attempt + 1}/5)...")
                 await asyncio.sleep(3)
 
         if not resolved:
-            log.error(
-                f"  ❌ Could not resolve channel {channel_id} after 5 attempts. "
-                "Will rely on dynamic resolution during stream playback."
-            )
+            log.error(f"  ❌ Could not resolve channel {channel_id} after 5 attempts. Will rely on dynamic resolution.")
 
 
 async def _backfill_access_hashes():
-    """Backfill channel_access_hash on video docs that are missing it."""
     try:
         pipeline = [
             {"$match": {"channel_access_hash": {"$exists": False}}},
@@ -569,7 +614,6 @@ async def _backfill_access_hashes():
             channel_id = ch_doc["_id"]
             if not channel_id:
                 continue
-            # Try DB first (might have been saved by _force_resolve_channels)
             access_hash = await _get_access_hash_from_db(channel_id)
             if access_hash is None:
                 for client_name, client in [("bot", bot_app), ("stream", stream_client)]:
@@ -592,13 +636,12 @@ async def _backfill_access_hashes():
 
 
 # ===================================================================
-# Lifespan  — starts bot, stream client, registers sync, resolves peers
+# Lifespan
 # ===================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global stream_client, bot_app
 
-    # --- Bot client (in_memory=True for Render ephemeral FS) ---
     bot_app = Client(
         "nexstream_bot",
         api_id=TELEGRAM_API_ID,
@@ -616,10 +659,8 @@ async def lifespan(app: FastAPI):
         _clients_started["bot"] = True
     log.info("Bot session started (in_memory=True).")
 
-    # Register sync handlers NOW (after bot is started)
     _register_sync_handlers(bot_app)
 
-    # --- Optional user session for streaming ---
     if SESSION_STRING:
         stream_client = Client(
             "nexstream_user",
@@ -642,11 +683,11 @@ async def lifespan(app: FastAPI):
         log.warning("⚠️  No SESSION_STRING provided. Streaming via bot session.")
 
     await ensure_indexes()
-
-    # Force-resolve channels (background — don't block startup)
     asyncio.create_task(_force_resolve_channels())
-    # Backfill missing access hashes
     asyncio.create_task(_backfill_access_hashes())
+    
+    # Start periodic cleanup task to remove deleted videos from DB
+    asyncio.create_task(_cleanup_deleted_videos())
 
     log.info("NexStream API + Sync Bot initialized.")
     yield
@@ -660,15 +701,9 @@ async def lifespan(app: FastAPI):
 
 
 # ===================================================================
-# GZip Middleware  (bypasses streaming endpoints)
+# GZip Middleware
 # ===================================================================
 class MediaAwareGZipMiddleware:
-    """GZip middleware that skips media/streaming endpoints.
-
-    Compressing video bytes would break range requests and waste CPU on
-    Render's free tier, so we only GZip JSON/text API responses.
-    """
-
     STREAM_PREFIXES = (
         "/watch/",
         "/download/",
@@ -690,11 +725,10 @@ class MediaAwareGZipMiddleware:
 
 
 # ===================================================================
-# FastAPI app
+# FastAPI App
 # ===================================================================
 web = FastAPI(lifespan=lifespan, docs_url="/docs", redoc_url=None)
 
-# GZip first (innermost), CORS second (outermost)
 web.add_middleware(MediaAwareGZipMiddleware, minimum_size=1000)
 web.add_middleware(
     CORSMiddleware,
@@ -717,10 +751,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         raise exc
     if isinstance(exc, StreamAbort):
         return Response(status_code=204, content=b"")
-    log.error(
-        f"Unhandled exception on {request.method} {request.url.path}: {exc}",
-        exc_info=True,
-    )
+    log.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
         content={"detail": f"Internal server error: {type(exc).__name__}"},
@@ -764,7 +795,6 @@ def format_video_doc(d: dict) -> Optional[dict]:
     else:
         d["stream_url"] = ""
         d["download_url"] = ""
-    # VLC handoff URL
     d["vlc_url"] = f"{base}/api/video/{d['id']}/vlc"
     if not d.get("genres"):
         d["genres"] = []
@@ -932,13 +962,6 @@ def _parse_range(range_header: Optional[str], file_size: int):
 
 
 async def _fetch_message_fresh(doc: dict):
-    """3-tier fallback for fetching a message from Telegram.
-
-    Tier 1: Direct get_messages().
-    Tier 2: get_chat() to wake Pyrogram's peer cache, then retry get_messages().
-    Tier 3: Raw MTProto API (Channels.GetMessages) using the access_hash
-            persisted in MongoDB.
-    """
     fetch_client = None
     if stream_client is not None and _clients_started["stream"]:
         fetch_client = stream_client
@@ -952,10 +975,10 @@ async def _fetch_message_fresh(doc: dict):
     if not channel_id or not message_id:
         raise HTTPException(400, "Missing channel_id or message_id")
 
-    # ── Tier 1: Direct fetch ──────────────────────────────────────
+    # Tier 1: Direct fetch
     try:
         msg = await fetch_client.get_messages(channel_id, message_id)
-        if msg:
+        if msg and not getattr(msg, "empty", False):
             return msg
     except PeerIdInvalid:
         log.warning(f"PeerIdInvalid for channel {channel_id} (tier 1)")
@@ -966,11 +989,10 @@ async def _fetch_message_fresh(doc: dict):
         else:
             log.error(f"get_messages failed (tier 1): {e}")
 
-    # ── Tier 2: get_chat to wake cache, then retry ────────────────
+    # Tier 2: get_chat to wake cache
     log.info(f"Tier 2: get_chat to wake cache for channel {channel_id}...")
     try:
         await fetch_client.get_chat(channel_id)
-        # Now try resolve_peer to grab the access_hash
         try:
             peer = await fetch_client.resolve_peer(channel_id)
             if hasattr(peer, "access_hash") and peer.access_hash:
@@ -978,12 +1000,12 @@ async def _fetch_message_fresh(doc: dict):
         except Exception:
             pass
         msg = await fetch_client.get_messages(channel_id, message_id)
-        if msg:
+        if msg and not getattr(msg, "empty", False):
             return msg
     except Exception as e:
         log.warning(f"Tier 2 failed for channel {channel_id}: {e}")
 
-    # ── Tier 3: Raw MTProto with saved access_hash ────────────────
+    # Tier 3: Raw MTProto
     access_hash = doc.get("channel_access_hash")
     if access_hash is None:
         access_hash = await _get_access_hash_from_db(channel_id)
@@ -994,17 +1016,13 @@ async def _fetch_message_fresh(doc: dict):
             f"Cannot resolve channel {channel_id}: no access_hash saved. Wait for sync to complete."
         )
 
-    log.info(
-        f"Tier 3: Raw MTProto API for channel {channel_id}, "
-        f"message {message_id}..."
-    )
+    log.info(f"Tier 3: Raw MTProto API for channel {channel_id}, message {message_id}...")
     try:
         raw_channel_id = abs(channel_id) - 1000000000000
         if raw_channel_id <= 0:
             raise HTTPException(
                 503,
-                f"Channel {channel_id} is not a superchannel — "
-                f"raw API not applicable",
+                f"Channel {channel_id} is not a superchannel — raw API not applicable",
             )
 
         input_channel = raw_types.InputChannel(
@@ -1019,14 +1037,15 @@ async def _fetch_message_fresh(doc: dict):
         )
         from pyrogram import utils as pyro_utils
         messages_list = await pyro_utils.parse_messages(fetch_client, r)
-        if messages_list:
+        if messages_list and not getattr(messages_list[0], "empty", False):
             return messages_list[0]
-        raise HTTPException(503, "Message not found via raw API")
     except HTTPException:
         raise
     except Exception as e:
         log.error(f"Tier 3 failed: {e}")
         raise HTTPException(503, f"All peer resolution methods failed: {e}")
+
+    raise HTTPException(404, "Message not found or deleted")
 
 
 async def _extract_file_info(msg) -> dict:
@@ -1050,12 +1069,20 @@ async def _extract_file_info(msg) -> dict:
         mime_type = msg.audio.mime_type or "audio/mpeg"
         file_name = msg.audio.file_name
     else:
-        raise HTTPException(400, "Message has no downloadable media")
+        try:
+            from pyrogram.raw.types import MessageMediaUnsupported
+            if isinstance(msg.media, MessageMediaUnsupported):
+                raise HTTPException(503, "File is unsupported (likely >2.0GB and requires Telegram Premium to stream)")
+        except ImportError:
+            pass
+        raise HTTPException(404, "Message has no downloadable media or was deleted")
+        
     if not file_id:
         raise HTTPException(400, "No file_id from fresh message")
-    # Some files might report 0 size but still be streamable. We warn but proceed.
+        
     if file_size <= 0:
         log.warning("File size is 0 in metadata. Proceeding, but range requests might fail.")
+        
     return {
         "file_id": file_id,
         "file_size": file_size,
@@ -1078,15 +1105,12 @@ async def _update_db_with_fresh_info(doc: dict, msg, file_info: dict):
         media = msg.video or msg.document
         if media and hasattr(media, "thumbs") and media.thumbs:
             try:
-                new_thumb_id = max(
-                    media.thumbs, key=lambda t: t.width or 0
-                ).file_id
+                new_thumb_id = max(media.thumbs, key=lambda t: t.width or 0).file_id
                 if new_thumb_id:
                     update_set["thumb_file_id"] = new_thumb_id
             except (ValueError, AttributeError):
                 pass
         await videos_col.update_one({"_id": doc["_id"]}, {"$set": update_set})
-        # Invalidate both cache keys
         await _invalidate_video_cache(
             doc["_id"],
             doc.get("message_id"),
@@ -1102,9 +1126,6 @@ async def build_stream_response(
     force_download: bool = False,
     custom_filename: str = None,
 ):
-    """Build a StreamingResponse with read-ahead buffering, auto file_id
-    refresh on FileReferenceExpired, and client-disconnect detection."""
-
     msg = await _fetch_message_fresh(doc)
     file_info = await _extract_file_info(msg)
     await _update_db_with_fresh_info(doc, msg, file_info)
@@ -1116,7 +1137,6 @@ async def build_stream_response(
     chunk_offset = start // CHUNK_SIZE
     discard = start % CHUNK_SIZE
     
-    # Calculate chunk limit dynamically (or infinite if size is unknown)
     if length > 0:
         chunk_limit = math.ceil((length + discard) / CHUNK_SIZE)
     else:
@@ -1132,45 +1152,29 @@ async def build_stream_response(
 
     file_id = file_info["file_id"]
 
-    # ── Streaming generator with read-ahead buffer ────────────────
     async def stream_generator():
-        """Read-ahead buffered streaming with:
-        - asyncio.Queue pre-fetch (READAHEAD_CHUNKS chunks ahead)
-        - Auto FileReferenceExpired recovery (refresh file_id, resume)
-        - Client disconnect detection (cancels upstream download)
-        """
-
-        queue: asyncio.Queue = asyncio.Queue(
-            maxsize=max(1, READAHEAD_CHUNKS)
-        )
+        queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, READAHEAD_CHUNKS))
         cancel_event = asyncio.Event()
 
-        # Shared mutable state between producer and consumer
         state = {
             "file_id": file_id,
-            "chunks_pulled": 0,    # chunks consumed from stream_media
-            "iterator": None,     # current async iterator
+            "chunks_pulled": 0,
+            "iterator": None,
         }
 
         async def _refresh_file_id() -> bool:
-            """Re-fetch the message to get a fresh file_id.
-            Returns True on success, False on failure."""
             try:
                 fresh_msg = await _fetch_message_fresh(doc)
                 fresh_info = await _extract_file_info(fresh_msg)
                 await _update_db_with_fresh_info(doc, fresh_msg, fresh_info)
                 state["file_id"] = fresh_info["file_id"]
-                log.info(
-                    f"Resuming stream with refreshed file_id "
-                    f"(chunks_pulled={state['chunks_pulled']})"
-                )
+                log.info(f"Resuming stream with refreshed file_id (chunks_pulled={state['chunks_pulled']})")
                 return True
             except Exception as e:
                 log.error(f"Failed to refresh file_id: {e}")
                 return False
 
         async def producer():
-            """Background task: pre-fetch chunks into the queue."""
             try:
                 while not cancel_event.is_set():
                     if state["iterator"] is None:
@@ -1196,15 +1200,12 @@ async def build_stream_response(
                             return
 
                     try:
-                        # Using async for prevents StopAsyncIteration leakage
                         async for chunk in state["iterator"]:
                             if cancel_event.is_set():
                                 return
                             state["chunks_pulled"] += 1
-                            # Put into queue, will wait if full (backpressure)
                             await queue.put(chunk)
                         
-                        # If we reach here, iterator exhausted cleanly
                         await queue.put(None)
                         return
                     except FileReferenceExpired:
@@ -1230,15 +1231,10 @@ async def build_stream_response(
                     pass
 
         async def disconnect_watcher():
-            """Poll for client disconnect every 2s. If the player is
-            closed or the user seeks, cancel the upstream download."""
             while not cancel_event.is_set():
                 try:
                     if await request.is_disconnected():
-                        log.debug(
-                            "Client disconnected — cancelling "
-                            "upstream Telegram download"
-                        )
+                        log.debug("Client disconnected — cancelling upstream Telegram download")
                         cancel_event.set()
                         return
                 except Exception:
@@ -1257,18 +1253,11 @@ async def build_stream_response(
                 first_chunk = True
 
                 while not cancel_event.is_set():
-                    # Wait for next chunk from the read-ahead queue
                     try:
-                        chunk = await asyncio.wait_for(
-                            queue.get(),
-                            timeout=60,
-                        )
+                        chunk = await asyncio.wait_for(queue.get(), timeout=60)
                     except asyncio.TimeoutError:
                         if producer_task.done() and queue.empty():
-                            log.warning(
-                                "Producer finished & queue empty "
-                                "— ending stream"
-                            )
+                            log.warning("Producer finished & queue empty — ending stream")
                             return
                         if cancel_event.is_set():
                             return
@@ -1279,7 +1268,6 @@ async def build_stream_response(
                     if chunk is None:
                         return
 
-                    # Apply byte-offset discard on the very first chunk
                     if first_chunk and discard > 0:
                         chunk = chunk[discard:]
                     first_chunk = False
@@ -1287,7 +1275,6 @@ async def build_stream_response(
                     if not chunk:
                         continue
 
-                    # If length is 0 (unknown size), just yield everything
                     if length <= 0:
                         yield chunk
                         sent += len(chunk)
@@ -1306,7 +1293,6 @@ async def build_stream_response(
         except asyncio.CancelledError:
             log.debug("Stream generator cancelled")
         finally:
-            # Cancel background tasks to free RAM and bandwidth
             cancel_event.set()
             for task in [producer_task, watcher_task]:
                 if task and not task.done():
@@ -1325,20 +1311,13 @@ async def build_stream_response(
         
     quoted_filename = quote(filename)
     if force_download:
-        headers["Content-Disposition"] = (
-            f"attachment; filename=\"{quoted_filename}\"; "
-            f"filename*=UTF-8''{quoted_filename}"
-        )
+        headers["Content-Disposition"] = f"attachment; filename=\"{quoted_filename}\"; filename*=UTF-8''{quoted_filename}"
     else:
-        headers["Content-Disposition"] = (
-            f"inline; filename=\"{quoted_filename}\""
-        )
+        headers["Content-Disposition"] = f"inline; filename=\"{quoted_filename}\""
 
     status_code = 200
     if range_header and length > 0:
-        headers["Content-Range"] = (
-            f"bytes {start}-{end}/{file_info['file_size']}"
-        )
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_info['file_size']}"
         status_code = 206
 
     return StreamingResponse(
@@ -1392,9 +1371,7 @@ async def download_permanent(
     doc = await _get_video_by_message(message_id, file_unique_id)
     if not doc:
         raise HTTPException(404, "Not found")
-    return await build_stream_response(
-        doc, request, force_download=True, custom_filename=filename
-    )
+    return await build_stream_response(doc, request, force_download=True, custom_filename=filename)
 
 
 # ===================================================================
@@ -1456,15 +1433,10 @@ async def get_all_links(vid: str, user=Depends(auth)):
 
 
 # ===================================================================
-# VLC HANDOFF  (audio track / subtitle switching via VLC)
+# VLC HANDOFF
 # ===================================================================
 @web.get("/api/video/{vid}/vlc")
 async def get_vlc_playlist(vid: str):
-    """Generate and download an .m3u playlist file that opens the stream
-    in VLC natively. This allows users to switch audio tracks and
-    subtitles — features that server-side transcoding would normally
-    provide but aren't possible on Render's free tier (no FFmpeg).
-    """
     doc = await _get_video_by_id(validate_object_id(vid))
     if not doc:
         raise HTTPException(404, "Not found")
@@ -1474,11 +1446,8 @@ async def get_vlc_playlist(vid: str):
         raise HTTPException(500, "Video is missing message_id or file_unique_id")
 
     title = doc.get("title") or doc.get("file_name") or "Stream"
-    stream_url = (
-        f"{BASE_URL}/watch/{doc['message_id']}/{doc['file_unique_id']}"
-    )
+    stream_url = f"{BASE_URL}/watch/{doc['message_id']}/{doc['file_unique_id']}"
 
-    # Build .m3u playlist content
     playlist = (
         "#EXTM3U\n"
         f"#EXTINF:-1,{title}\n"
@@ -1494,10 +1463,7 @@ async def get_vlc_playlist(vid: str):
         content=playlist.encode("utf-8"),
         media_type="audio/x-mpegurl",
         headers={
-            "Content-Disposition": (
-                f"attachment; filename=\"{quoted}\"; "
-                f"filename*=UTF-8''{quoted}"
-            ),
+            "Content-Disposition": f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}",
             "Cache-Control": "no-cache",
         },
     )
@@ -1524,7 +1490,6 @@ async def get_thumb(vid: str):
     if not doc:
         raise HTTPException(404, "Not found")
 
-    # Early exit: if DB explicitly says there's no thumbnail, don't hit Telegram
     if doc.get("thumb_file_id") is None:
         raise HTTPException(404, "No thumbnail available")
 
@@ -1540,13 +1505,10 @@ async def get_thumb(vid: str):
     media = msg.video or msg.document
     if media and hasattr(media, "thumbs") and media.thumbs:
         try:
-            thumb_file_id = max(
-                media.thumbs, key=lambda t: t.width or 0
-            ).file_id
+            thumb_file_id = max(media.thumbs, key=lambda t: t.width or 0).file_id
         except (ValueError, AttributeError):
             pass
     if not thumb_file_id:
-        # Update DB so we don't try fetching it again
         try:
             await videos_col.update_one({"_id": oid}, {"$set": {"thumb_file_id": None}})
             await _invalidate_video_cache(oid, doc.get("message_id"), doc.get("file_unique_id"))
@@ -1554,10 +1516,7 @@ async def get_thumb(vid: str):
         raise HTTPException(404, "No thumbnail available")
 
     try:
-        await videos_col.update_one(
-            {"_id": oid},
-            {"$set": {"thumb_file_id": thumb_file_id}},
-        )
+        await videos_col.update_one({"_id": oid}, {"$set": {"thumb_file_id": thumb_file_id}})
     except Exception:
         pass
 
@@ -1673,7 +1632,6 @@ async def get_stats():
 async def health():
     try:
         count = await videos_col.estimated_document_count()
-        # Active streams (best-effort — _value is CPython internal)
         try:
             active = MAX_CONCURRENT_STREAMS - _stream_semaphore._value
         except Exception:
