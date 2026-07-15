@@ -335,6 +335,7 @@ web.add_middleware(
         "http://localhost:5500",
         "http://127.0.0.1:5500",
         "https://nb-orwg.onrender.com",
+        "https://benevolent-lily-98c510.netlify.app/"
     ],
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
