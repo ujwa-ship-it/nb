@@ -549,7 +549,8 @@ async def _force_resolve_channels():
 
         if not resolved:
             log.error(
-                f"  ❌ Could not resolve channel {channel_id} after 5 attempts"
+                f"  ❌ Could not resolve channel {channel_id} after 5 attempts. "
+                "Will rely on dynamic resolution during stream playback."
             )
 
 
@@ -925,7 +926,7 @@ def _parse_range(range_header: Optional[str], file_size: int):
                 start = int(match.group(1))
                 if match.group(2):
                     end = min(int(match.group(2)), file_size - 1)
-    if start >= file_size:
+    if file_size > 0 and start >= file_size:
         raise HTTPException(416, "Requested range not satisfiable")
     return start, end
 
@@ -964,7 +965,6 @@ async def _fetch_message_fresh(doc: dict):
             log.warning(f"PeerIdInvalid variant (tier 1): {e}")
         else:
             log.error(f"get_messages failed (tier 1): {e}")
-            # Non-peer errors may be transient — still try tier 2
 
     # ── Tier 2: get_chat to wake cache, then retry ────────────────
     log.info(f"Tier 2: get_chat to wake cache for channel {channel_id}...")
@@ -991,7 +991,7 @@ async def _fetch_message_fresh(doc: dict):
     if access_hash is None:
         raise HTTPException(
             503,
-            f"Cannot resolve channel {channel_id}: no access_hash saved",
+            f"Cannot resolve channel {channel_id}: no access_hash saved. Wait for sync to complete."
         )
 
     log.info(
@@ -1053,8 +1053,9 @@ async def _extract_file_info(msg) -> dict:
         raise HTTPException(400, "Message has no downloadable media")
     if not file_id:
         raise HTTPException(400, "No file_id from fresh message")
+    # Some files might report 0 size but still be streamable. We warn but proceed.
     if file_size <= 0:
-        raise HTTPException(400, "Invalid file size")
+        log.warning("File size is 0 in metadata. Proceeding, but range requests might fail.")
     return {
         "file_id": file_id,
         "file_size": file_size,
@@ -1111,10 +1112,15 @@ async def build_stream_response(
     client = _get_stream_client()
     range_header = request.headers.get("range")
     start, end = _parse_range(range_header, file_info["file_size"])
-    length = end - start + 1
+    length = end - start + 1 if file_info["file_size"] > 0 else 0
     chunk_offset = start // CHUNK_SIZE
     discard = start % CHUNK_SIZE
-    chunk_limit = math.ceil((length + discard) / CHUNK_SIZE)
+    
+    # Calculate chunk limit dynamically (or infinite if size is unknown)
+    if length > 0:
+        chunk_limit = math.ceil((length + discard) / CHUNK_SIZE)
+    else:
+        chunk_limit = 0  # 0 means unlimited in Pyrogram's stream_media
 
     filename = custom_filename or file_info["file_name"]
     if not filename:
@@ -1163,87 +1169,55 @@ async def build_stream_response(
                 log.error(f"Failed to refresh file_id: {e}")
                 return False
 
-        async def _next_chunk():
-            """Fetch next chunk from Telegram. On FileReferenceExpired,
-            refresh file_id and resume from the correct offset."""
-
-            while True:
-                if cancel_event.is_set():
-                    return None
-
-                # Create iterator if needed
-                if state["iterator"] is None:
-                    offset = chunk_offset + state["chunks_pulled"]
-                    remaining_limit = chunk_limit - state["chunks_pulled"]
-                    if remaining_limit <= 0:
-                        return None
-                    try:
-                        state["iterator"] = client.stream_media(
-                            state["file_id"],
-                            limit=remaining_limit,
-                            offset=offset,
-                        ).__aiter__()
-                    except FileReferenceExpired:
-                        log.info(
-                            "FileReferenceExpired on iterator creation "
-                            "— refreshing"
-                        )
-                        state["iterator"] = None
-                        if not await _refresh_file_id():
-                            return None
-                        continue
-                    except Exception as e:
-                        log.error(f"Failed to start stream_media: {e}")
-                        return None
-
-                # Pull next chunk
-                try:
-                    chunk = await asyncio.wait_for(
-                        state["iterator"].__anext__(),
-                        timeout=300,
-                    )
-                    state["chunks_pulled"] += 1
-                    return chunk
-                except StopAsyncIteration:
-                    return None
-                except FileReferenceExpired:
-                    log.info(
-                        "FileReferenceExpired mid-stream — "
-                        "refreshing file_id and resuming"
-                    )
-                    state["iterator"] = None
-                    if not await _refresh_file_id():
-                        return None
-                    # Loop continues — new iterator created with fresh
-                    # file_id at offset chunk_offset + chunks_pulled
-                except asyncio.TimeoutError:
-                    log.warning("Chunk fetch timeout (300s) — aborting stream")
-                    return None
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    log.error(f"Chunk fetch error: {e}")
-                    return None
-
         async def producer():
-            """Background task: pre-fetch chunks into the queue so the
-            consumer (video player) gets them instantly from RAM."""
+            """Background task: pre-fetch chunks into the queue."""
             try:
                 while not cancel_event.is_set():
-                    chunk = await _next_chunk()
+                    if state["iterator"] is None:
+                        offset = chunk_offset + state["chunks_pulled"]
+                        remaining_limit = chunk_limit - state["chunks_pulled"] if chunk_limit > 0 else 0
+                        if remaining_limit <= 0 and chunk_limit > 0:
+                            await queue.put(None)
+                            return
+                        try:
+                            state["iterator"] = client.stream_media(
+                                state["file_id"],
+                                limit=remaining_limit if remaining_limit > 0 else None,
+                                offset=offset,
+                            )
+                        except FileReferenceExpired:
+                            if not await _refresh_file_id():
+                                await queue.put(None)
+                                return
+                            continue
+                        except Exception as e:
+                            log.error(f"Failed to start stream_media: {e}")
+                            await queue.put(None)
+                            return
+
                     try:
-                        await asyncio.wait_for(
-                            queue.put(chunk),
-                            timeout=120,
-                        )
-                    except asyncio.TimeoutError:
-                        log.warning(
-                            "Queue put timeout — consumer stalled?"
-                        )
+                        # Using async for prevents StopAsyncIteration leakage
+                        async for chunk in state["iterator"]:
+                            if cancel_event.is_set():
+                                return
+                            state["chunks_pulled"] += 1
+                            # Put into queue, will wait if full (backpressure)
+                            await queue.put(chunk)
+                        
+                        # If we reach here, iterator exhausted cleanly
+                        await queue.put(None)
                         return
+                    except FileReferenceExpired:
+                        state["iterator"] = None
+                        if not await _refresh_file_id():
+                            await queue.put(None)
+                            return
+                        continue
                     except asyncio.CancelledError:
                         raise
-                    if chunk is None:
+                    except Exception as e:
+                        log.error(f"Chunk fetch error: {e}")
+                        await queue.put(None)
                         return
             except asyncio.CancelledError:
                 log.debug("Producer cancelled")
@@ -1313,6 +1287,12 @@ async def build_stream_response(
                     if not chunk:
                         continue
 
+                    # If length is 0 (unknown size), just yield everything
+                    if length <= 0:
+                        yield chunk
+                        sent += len(chunk)
+                        continue
+
                     remaining = length - sent
                     if len(chunk) >= remaining:
                         yield chunk[:remaining]
@@ -1338,9 +1318,11 @@ async def build_stream_response(
 
     headers = {
         "Accept-Ranges": "bytes",
-        "Content-Length": str(length),
         "Cache-Control": "public, max-age=86400",
     }
+    if length > 0:
+        headers["Content-Length"] = str(length)
+        
     quoted_filename = quote(filename)
     if force_download:
         headers["Content-Disposition"] = (
@@ -1353,7 +1335,7 @@ async def build_stream_response(
         )
 
     status_code = 200
-    if range_header:
+    if range_header and length > 0:
         headers["Content-Range"] = (
             f"bytes {start}-{end}/{file_info['file_size']}"
         )
@@ -1542,6 +1524,10 @@ async def get_thumb(vid: str):
     if not doc:
         raise HTTPException(404, "Not found")
 
+    # Early exit: if DB explicitly says there's no thumbnail, don't hit Telegram
+    if doc.get("thumb_file_id") is None:
+        raise HTTPException(404, "No thumbnail available")
+
     try:
         msg = await _fetch_message_fresh(doc)
     except HTTPException:
@@ -1560,6 +1546,11 @@ async def get_thumb(vid: str):
         except (ValueError, AttributeError):
             pass
     if not thumb_file_id:
+        # Update DB so we don't try fetching it again
+        try:
+            await videos_col.update_one({"_id": oid}, {"$set": {"thumb_file_id": None}})
+            await _invalidate_video_cache(oid, doc.get("message_id"), doc.get("file_unique_id"))
+        except: pass
         raise HTTPException(404, "No thumbnail available")
 
     try:
