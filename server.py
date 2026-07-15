@@ -741,6 +741,7 @@ web.add_middleware(
         "http://127.0.0.1:5500",
         "https://nb-orwg.onrender.com",
         "https://obst.netlify.app",
+        "https://obstr.netlify.app",
     ],
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
