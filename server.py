@@ -30,7 +30,10 @@ from pyrogram.raw import types as raw_types
 try:
     from starlette.exceptions import ClientDisconnect
 except ImportError:
-    class ClientDisconnect(Exception): pass
+    try:
+        from starlette._exception import ClientDisconnect
+    except ImportError:
+        class ClientDisconnect(Exception): pass
 
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -42,7 +45,10 @@ load_dotenv()
 # ===================================================================
 # Logging
 # ===================================================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+)
 log = logging.getLogger("nexstream")
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
@@ -73,10 +79,10 @@ CHANNELS = [int(ch.strip()) for ch in CHANNELS_RAW.split(",") if ch.strip()]
 
 # Optimized for 512MB RAM on Render Free Tier
 CHUNK_SIZE            = 1024 * 1024  # 1MB chunks
-MAX_CONCURRENT_STREAMS = 2           # Hard limit to prevent OOM on Render
-MAX_THUMB_CACHE       = 50           # Reduced cache
-MAX_DOC_CACHE         = 50           # Small DB cache
-READAHEAD_CHUNKS      = 1            # Only pre-fetch 1 chunk to save RAM
+MAX_CONCURRENT_STREAMS = int(os.getenv("MAX_CONCURRENT_STREAMS", "4"))
+MAX_THUMB_CACHE       = int(os.getenv("MAX_THUMB_CACHE", "100"))
+MAX_DOC_CACHE         = int(os.getenv("MAX_DOC_CACHE", "100"))
+READAHEAD_CHUNKS      = 1            # Pre-fetch 1 chunk to save RAM
 
 # ===================================================================
 # Database
@@ -199,6 +205,8 @@ async def get_video_doc(vid: str, projection: Optional[dict] = None) -> Optional
     if doc: await doc_cache.set(vid, doc)
     return doc
 
+async def invalidate_doc(vid: str): await doc_cache.invalidate(vid)
+
 # ===================================================================
 # SYNC LOGIC
 # ===================================================================
@@ -268,7 +276,9 @@ def _register_sync_handlers(client: Client):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global stream_client, bot_app
-    bot_app = Client("nexstream_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, bot_token=BOT_TOKEN, in_memory=False)
+    
+    # in_memory=True prevents Render disk corruption issues
+    bot_app = Client("nexstream_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, bot_token=BOT_TOKEN, in_memory=True)
     try:
         await bot_app.start(); _clients_started["bot"] = True
     except FloodWait as e:
@@ -281,8 +291,28 @@ async def lifespan(app: FastAPI):
             await stream_client.start(); _clients_started["stream"] = True
         except: stream_client = None
 
+    # ===================================================================
+    # FIX: Force resolve all channels at startup to prevent PeerIdInvalid
+    # ===================================================================
+    if CHANNELS:
+        log.info(f"Resolving {len(CHANNELS)} channels at startup to prevent PeerIdInvalid...")
+        resolver_client = stream_client if stream_client else bot_app
+        for ch_id in CHANNELS:
+            try:
+                chat = await resolver_client.get_chat(ch_id)
+                access_hash = chat.raw.access_hash if hasattr(chat, 'raw') and hasattr(chat.raw, 'access_hash') else None
+                if access_hash:
+                    await videos_col.update_many(
+                        {"channel_id": ch_id, "channel_access_hash": {"$ne": access_hash}},
+                        {"$set": {"channel_access_hash": access_hash}}
+                    )
+                log.info(f"✅ Successfully resolved channel {ch_id}")
+            except Exception as e:
+                log.error(f"❌ Failed to resolve channel {ch_id} at startup: {e}")
+
     await ensure_indexes()
     yield
+    
     for c in (stream_client, bot_app):
         if c:
             try: await c.stop()
@@ -290,30 +320,47 @@ async def lifespan(app: FastAPI):
 
 web = FastAPI(lifespan=lifespan, docs_url="/docs", redoc_url=None)
 web.add_middleware(GZipMiddleware, minimum_size=1024)
-web.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+web.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+        "https://nb-orwg.onrender.com",
+        "https://benevolent-lily-98c510.netlify.app",
+    ],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @web.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     if isinstance(exc, HTTPException): raise exc
     if isinstance(exc, StreamAbort): return Response(status_code=204, content=b"")
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    log.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(status_code=500, content={"detail": f"Internal server error: {type(exc).__name__}"})
 
 async def ensure_indexes():
     try:
+        existing = await videos_col.index_information()
+        if "channel_id_1_message_id_1" in existing:
+            if not existing["channel_id_1_message_id_1"].get("unique", False): await videos_col.drop_index("channel_id_1_message_id_1")
         await videos_col.create_index("file_unique_id", unique=True, sparse=True)
         await videos_col.create_index([("channel_id", 1), ("message_id", 1)], unique=True, name="channel_message_unique")
         await videos_col.create_index("type")
         await videos_col.create_index([("title", "text")])
+        await videos_col.create_index("date")
         await videos_col.create_index("message_id")
         await users_col.create_index("token")
         await users_col.create_index("email", unique=True, sparse=True)
-    except: pass
+    except Exception as e: log.warning("Could not ensure indexes: %s", e)
 
 def format_video_doc(d: dict) -> Optional[dict]:
     if not d: return None
     d = dict(d); d["id"] = str(d.pop("_id"))
     base = BASE_URL or ""
-    d["thumb_url"] = f"{base}/api/thumb/{d['id']}" if d.get("thumb_file_id") else ""
+    d["thumb_url"] = d.get("thumb_url") or (f"{base}/api/thumb/{d['id']}" if d.get("thumb_file_id") else "")
     if d.get("message_id") and d.get("file_unique_id"):
         d["stream_url"] = f"{base}/watch/{d['message_id']}/{d['file_unique_id']}"
         d["download_url"] = f"{base}/download/{d['message_id']}/{d['file_unique_id']}"
@@ -337,7 +384,7 @@ async def register(data: dict):
     token = secrets.token_hex(32)
     hashed = await asyncio.get_running_loop().run_in_executor(None, hash_pw, pw)
     try:
-        await users_col.insert_one({"name": name, "email": email, "password": hashed, "token": token, "expires_at": datetime.now(timezone.utc) + timedelta(days=30), "my_list": [], "history": []})
+        await users_col.insert_one({"name": name, "email": email, "password": hashed, "token": token, "expires_at": datetime.now(timezone.utc) + timedelta(days=30), "my_list": [], "history": [], "created_at": datetime.now(timezone.utc)})
     except DuplicateKeyError: raise HTTPException(400, "Email already exists")
     return {"token": token, "name": name, "email": email}
 
@@ -362,17 +409,20 @@ async def logout(user: dict = Depends(auth)):
 # ===================================================================
 # MOVIES / GAMES / SEARCH
 # ===================================================================
+def _apply_genre_filter(q: dict, genre: str):
+    if genre and genre.lower() != "all": q["genres"] = {"$in": [genre.lower()]}
+
 @web.get("/api/movies")
 async def get_movies(page: int = 1, limit: int = 20, genre: str = ""):
-    q = {"type": "movie"}
-    if genre and genre.lower() != "all": q["genres"] = {"$in": [genre.lower()]}
+    page, limit = max(1, page), max(1, min(limit, 100))
+    q = {"type": "movie"}; _apply_genre_filter(q, genre)
     docs = await videos_col.find(q).sort("date", -1).skip((page - 1) * limit).limit(limit).to_list(length=limit)
     return {"total": await videos_col.count_documents(q), "page": page, "data": [format_video_doc(d) for d in docs]}
 
 @web.get("/api/games")
 async def get_games(page: int = 1, limit: int = 20, genre: str = ""):
-    q = {"type": "game"}
-    if genre and genre.lower() != "all": q["genres"] = {"$in": [genre.lower()]}
+    page, limit = max(1, page), max(1, min(limit, 100))
+    q = {"type": "game"}; _apply_genre_filter(q, genre)
     docs = await videos_col.find(q).sort("date", -1).skip((page - 1) * limit).limit(limit).to_list(length=limit)
     return {"total": await videos_col.count_documents(q), "page": page, "data": [format_video_doc(d) for d in docs]}
 
@@ -385,9 +435,26 @@ async def get_movie(vid: str):
 @web.get("/api/search")
 async def search(q: str = "", page: int = 1, limit: int = 20):
     if not q or len(q) < 2: return {"total": 0, "page": page, "data": []}
+    page, limit = max(1, page), max(1, min(limit, 100))
     q_filter = {"title": {"$regex": escape_regex(q), "$options": "i"}}
     docs = await videos_col.find(q_filter).sort("date", -1).skip((page - 1) * limit).limit(limit).to_list(length=limit)
     return {"total": await videos_col.count_documents(q_filter), "page": page, "data": [format_video_doc(d) for d in docs]}
+
+# ===================================================================
+# Rating
+# ===================================================================
+@web.patch("/api/movies/{vid}/rating")
+async def set_rating(vid: str, data: dict, user: dict = Depends(auth)):
+    oid = validate_object_id(vid)
+    rating = data.get("rating")
+    if rating is None: raise HTTPException(400, "Missing 'rating' field")
+    try: rating = float(rating)
+    except: raise HTTPException(400, "Rating must be a number")
+    if not (0 <= rating <= 10): raise HTTPException(400, "Rating must be between 0 and 10")
+    result = await videos_col.update_one({"_id": oid}, {"$set": {"rating": round(rating, 1)}})
+    if result.matched_count == 0: raise HTTPException(404, "Not found")
+    await invalidate_doc(vid)
+    return {"ok": True, "rating": round(rating, 1)}
 
 # ===================================================================
 # STREAMING LOGIC (Robust & Fast for Render)
@@ -415,19 +482,24 @@ async def _fetch_message_fresh(doc: dict, max_retries: int = 1):
     if not channel_id or not message_id: raise HTTPException(400, "Missing channel_id or message_id")
 
     for attempt in range(max_retries + 1):
-        try: return await fetch_client.get_messages(channel_id, message_id)
+        # Tier 1: Try direct fetch
+        try: 
+            msg = await fetch_client.get_messages(channel_id, message_id)
+            if msg: return msg
         except PeerIdInvalid: pass
         except FileReferenceExpired: pass
         except FloodWait as e: await asyncio.sleep(min(e.value + 1, 10))
         except Exception as e:
             if "peer" not in str(e).lower() or "invalid" not in str(e).lower(): break
 
+        # Tier 2: Force get_chat to wake up the access_hash in Pyrogram's cache
         try:
-            await fetch_client.resolve_peer(channel_id)
+            await fetch_client.get_chat(channel_id)
             msg = await fetch_client.get_messages(channel_id, message_id)
             if msg: return msg
         except: pass
 
+        # Tier 3: Raw MTProto API using the access_hash we saved at startup
         access_hash = doc.get("channel_access_hash")
         if access_hash is not None:
             try:
@@ -438,7 +510,7 @@ async def _fetch_message_fresh(doc: dict, max_retries: int = 1):
                 if msgs: return msgs[0]
             except: pass
         if attempt < max_retries: await asyncio.sleep(0.5)
-    raise HTTPException(503, "Failed to fetch message")
+    raise HTTPException(503, "Failed to fetch message. Try again in a moment.")
 
 async def _extract_file_info(msg) -> dict:
     media = msg.video or msg.document or msg.audio
@@ -514,7 +586,7 @@ async def build_stream_response(doc: dict, request: Request, force_download: boo
     msg = await _fetch_message_fresh(doc)
     file_info = await _extract_file_info(msg)
     
-    # Update DB in background
+    # Update DB in background to prevent blocking the stream
     asyncio.create_task(videos_col.update_one({"_id": doc["_id"]}, {"$set": {"file_id": file_info["file_id"], "synced_at": datetime.now(timezone.utc)}}))
 
     client = _get_stream_client()
@@ -546,6 +618,12 @@ async def build_stream_response(doc: dict, request: Request, force_download: boo
 # ===================================================================
 # STREAMING ENDPOINTS
 # ===================================================================
+@web.head("/api/stream/{vid}")
+async def stream_head(vid: str, user=Depends(auth)):
+    doc = await get_video_doc(vid, projection={"file_size": 1, "mime_type": 1})
+    if not doc: raise HTTPException(404, "Not found")
+    return Response(status_code=200, headers={"Content-Length": str(doc.get("file_size", 0)), "Accept-Ranges": "bytes", "Content-Type": doc.get("mime_type", "video/mp4")})
+
 @web.get("/api/stream/{vid}")
 async def stream_video(vid: str, request: Request, user=Depends(auth)):
     doc = await get_video_doc(vid)
@@ -553,17 +631,50 @@ async def stream_video(vid: str, request: Request, user=Depends(auth)):
     return await build_stream_response(doc, request)
 
 @web.get("/watch/{message_id}/{file_unique_id}")
+@web.get("/watch/{message_id}/{file_unique_id}.mp4")
 async def watch_permanent(message_id: int, file_unique_id: str, request: Request):
     doc = await videos_col.find_one({"message_id": message_id, "file_unique_id": file_unique_id})
     if not doc: raise HTTPException(404, "Not found")
     return await build_stream_response(doc, request)
 
 @web.get("/download/{message_id}/{file_unique_id}")
+@web.get("/download/{message_id}/{file_unique_id}/{filename}")
 async def download_permanent(message_id: int, file_unique_id: str, request: Request, filename: str = None):
     doc = await videos_col.find_one({"message_id": message_id, "file_unique_id": file_unique_id})
     if not doc: raise HTTPException(404, "Not found")
     return await build_stream_response(doc, request, force_download=True, custom_filename=filename)
 
+# ===================================================================
+# URL GENERATION
+# ===================================================================
+@web.get("/api/video/{vid}/watch-url")
+async def get_watch_url(vid: str, user=Depends(auth)):
+    doc = await get_video_doc(vid, projection={"message_id": 1, "file_unique_id": 1})
+    if not doc: raise HTTPException(404, "Not found")
+    if not BASE_URL: raise HTTPException(500, "PUBLIC_BASE_URL is not configured")
+    if not doc.get("message_id") or not doc.get("file_unique_id"): raise HTTPException(500, "Video is missing message_id or file_unique_id")
+    return {"url": f"{BASE_URL}/watch/{doc['message_id']}/{doc['file_unique_id']}", "type": "stream", "permanent": True, "expires": None}
+
+@web.get("/api/video/{vid}/download-url")
+async def get_download_url(vid: str, user=Depends(auth)):
+    doc = await get_video_doc(vid, projection={"message_id": 1, "file_unique_id": 1})
+    if not doc: raise HTTPException(404, "Not found")
+    if not BASE_URL: raise HTTPException(500, "PUBLIC_BASE_URL is not configured")
+    if not doc.get("message_id") or not doc.get("file_unique_id"): raise HTTPException(500, "Video is missing message_id or file_unique_id")
+    return {"url": f"{BASE_URL}/download/{doc['message_id']}/{doc['file_unique_id']}", "type": "download", "permanent": True, "expires": None}
+
+@web.get("/api/video/{vid}/links")
+async def get_all_links(vid: str, user=Depends(auth)):
+    doc = await get_video_doc(vid, projection={"message_id": 1, "file_unique_id": 1, "title": 1, "file_size": 1})
+    if not doc: raise HTTPException(404, "Not found")
+    if not BASE_URL: raise HTTPException(500, "PUBLIC_BASE_URL is not configured")
+    if not doc.get("message_id") or not doc.get("file_unique_id"): raise HTTPException(500, "Video is missing message_id or file_unique_id")
+    mid, fuid = doc["message_id"], doc["file_unique_id"]
+    return {"stream_url": f"{BASE_URL}/watch/{mid}/{fuid}", "download_url": f"{BASE_URL}/download/{mid}/{fuid}", "permanent": True, "expires": None, "title": doc.get("title", ""), "file_size": doc.get("file_size", 0)}
+
+# ===================================================================
+# THUMBNAILS
+# ===================================================================
 @web.get("/api/thumb/{vid}")
 async def get_thumb(vid: str):
     cached = thumb_cache.get(vid)
@@ -584,9 +695,91 @@ async def get_thumb(vid: str):
         await thumb_cache.set(vid, buffer.getvalue())
     return StreamingResponse(stream_thumb(), media_type="image/jpeg")
 
-@web.get("/api/health")
-async def health(): return {"status": "ok", "stream_client": "user" if stream_client else "bot"}
+# ===================================================================
+# USER LIST / HISTORY
+# ===================================================================
+def _normalize_ids(ids):
+    valid = []
+    for i in ids or []:
+        try: valid.append(ObjectId(i))
+        except: continue
+    return valid
 
+@web.get("/api/user/list")
+async def get_list(user: dict = Depends(auth)):
+    raw_list = user.get("my_list", [])
+    valid_ids = _normalize_ids(raw_list)
+    docs = await videos_col.find({"_id": {"$in": valid_ids}}).to_list(length=len(valid_ids))
+    order = {str(i): idx for idx, i in enumerate(raw_list)}
+    docs.sort(key=lambda x: order.get(str(x["_id"]), 9999))
+    return [format_video_doc(d) for d in docs]
+
+@web.post("/api/user/list/{vid}")
+async def toggle_list(vid: str, data: dict = None, user: dict = Depends(auth)):
+    validate_object_id(vid)
+    if not await videos_col.find_one({"_id": ObjectId(vid)}, {"_id": 1}): raise HTTPException(404, "Not found")
+    action = (data or {}).get("action", "toggle").lower()
+    if action == "add":
+        await users_col.update_one({"_id": user["_id"]}, {"$addToSet": {"my_list": vid}}); return {"added": True}
+    if action == "remove":
+        await users_col.update_one({"_id": user["_id"]}, {"$pull": {"my_list": vid}}); return {"added": False}
+    if vid in user.get("my_list", []):
+        await users_col.update_one({"_id": user["_id"]}, {"$pull": {"my_list": vid}}); return {"added": False}
+    await users_col.update_one({"_id": user["_id"]}, {"$addToSet": {"my_list": vid}}); return {"added": True}
+
+@web.get("/api/user/history")
+async def get_history(user: dict = Depends(auth)):
+    raw_hist = user.get("history", [])
+    valid_ids = _normalize_ids(raw_hist)
+    docs = await videos_col.find({"_id": {"$in": valid_ids}}).to_list(length=len(valid_ids))
+    order = {str(i): idx for idx, i in enumerate(reversed(raw_hist))}
+    docs.sort(key=lambda x: order.get(str(x["_id"]), 9999))
+    return [format_video_doc(d) for d in docs]
+
+@web.post("/api/user/history/{vid}")
+async def add_history(vid: str, user: dict = Depends(auth)):
+    validate_object_id(vid)
+    await users_col.update_one({"_id": user["_id"]}, {"$pull": {"history": vid}})
+    await users_col.update_one({"_id": user["_id"]}, {"$push": {"history": {"$each": [vid], "$slice": -200}}})
+    return {"ok": True}
+
+@web.delete("/api/user/history")
+async def clear_history(user: dict = Depends(auth)):
+    await users_col.update_one({"_id": user["_id"]}, {"$set": {"history": []}})
+    return {"ok": True}
+
+# ===================================================================
+# STATS & HEALTH
+# ===================================================================
+@web.get("/api/stats")
+async def get_stats():
+    pipeline = [
+        {"$facet": {
+            "total": [{"$count": "count"}],
+            "movies": [{"$match": {"type": "movie"}}, {"$count": "count"}],
+            "games": [{"$match": {"type": "game"}}, {"$count": "count"}],
+            "channels": [{"$group": {"_id": "$channel_id"}}],
+        }}
+    ]
+    results = await videos_col.aggregate(pipeline).to_list(length=1)
+    res = results[0] if results else {}
+    def _c(arr): return arr[0]["count"] if arr else 0
+    return {"total_videos": _c(res.get("total", [])), "movies": _c(res.get("movies", [])), "games": _c(res.get("games", [])), "channels": len(res.get("channels", []))}
+
+@web.get("/api/health")
+async def health():
+    try:
+        count = await videos_col.estimated_document_count()
+        return {"status": "ok", "videos": count, "stream_client": "user" if stream_client else ("bot" if bot_app else "none"), "sync_enabled": bool(CHANNELS), "base_url": BASE_URL or "not configured"}
+    except Exception as e:
+        return JSONResponse({"status": "degraded", "error": str(e)}, status_code=503)
+
+@web.get("/favicon.ico")
+async def favicon(): return Response(status_code=204)
+
+# ===================================================================
+# Entrypoint
+# ===================================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:web", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
