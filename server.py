@@ -21,9 +21,16 @@ from pymongo.errors import DuplicateKeyError
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
+# V4: Loud fallback if pyrogram doesn't export these (verified fine on 2.0.106,
+# but if a future pin changes, this error makes the breakage visible instead
+# of silently disabling file-reference recovery).
 try:
     from pyrogram.errors import FileReferenceExpired, PeerIdInvalid
 except ImportError:
+    logging.error(
+        "pyrogram.errors.FileReferenceExpired/PeerIdInvalid not found — "
+        "file-reference recovery is DISABLED. Check your pyrogram version."
+    )
     class FileReferenceExpired(Exception):
         pass
     class PeerIdInvalid(Exception):
@@ -91,9 +98,20 @@ CHANNELS = [int(ch.strip()) for ch in CHANNELS_RAW.split(",") if ch.strip()]
 # ── Render Free-Tier Memory Limits ──────────────────────────────────
 CHUNK_SIZE             = 1024 * 1024                        # 1 MB
 MAX_CONCURRENT_STREAMS = int(os.getenv("MAX_CONCURRENT_STREAMS", "4"))
+MAX_CONCURRENT_THUMBS  = int(os.getenv("MAX_CONCURRENT_THUMBS", "6"))
 MAX_THUMB_CACHE        = int(os.getenv("MAX_THUMB_CACHE", "100"))
 MAX_DOC_CACHE          = int(os.getenv("MAX_DOC_CACHE", "100"))
 READAHEAD_CHUNKS       = int(os.getenv("READAHEAD_CHUNKS", "1"))
+
+# V1/V5: Hard ceilings for FloodWait retry — never retry forever
+FLOOD_MAX_RETRIES      = int(os.getenv("FLOOD_MAX_RETRIES", "5"))
+FLOOD_MAX_TOTAL_WAIT   = int(os.getenv("FLOOD_MAX_TOTAL_WAIT", "180"))
+
+# V3: Wall-clock budget per stream request (seconds)
+STREAM_WALL_CLOCK_BUDGET = int(os.getenv("STREAM_WALL_CLOCK_BUDGET", "300"))
+
+# D2: Extra CORS origins from env (comma-separated)
+EXTRA_CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
 # Telegram strictly limits non-premium downloads to 2.0 GB
 MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024
@@ -114,34 +132,14 @@ stream_client: Optional[Client] = None
 bot_app: Optional[Client] = None
 _clients_started: dict = {"stream": False, "bot": False}
 _stream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
+# T1: Separate semaphore for thumbnails so a page-load burst can't
+# exhaust the stream budget or flood Telegram with download_media calls.
+_thumb_semaphore = asyncio.Semaphore(MAX_CONCURRENT_THUMBS)
 
 
 # ===================================================================
-# Caches
+# Caches (T3: thumbnails now use LRUCache, same as doc_cache)
 # ===================================================================
-class BoundedCache:
-    def __init__(self, max_size: int = MAX_THUMB_CACHE):
-        self._max = max_size
-        self._data: dict[str, bytes] = {}
-        self._lock = asyncio.Lock()
-
-    def get(self, key: str) -> Optional[bytes]:
-        return self._data.get(key)
-
-    async def set(self, key: str, value: bytes):
-        async with self._lock:
-            if key in self._data:
-                self._data.pop(key)
-            self._data[key] = value
-            while len(self._data) > self._max:
-                oldest = next(iter(self._data))
-                self._data.pop(oldest, None)
-
-    async def invalidate(self, key: str):
-        async with self._lock:
-            self._data.pop(key, None)
-
-
 class LRUCache:
     def __init__(self, max_size: int = MAX_DOC_CACHE):
         self._max = max_size
@@ -171,13 +169,37 @@ class LRUCache:
             self._data.clear()
 
 
-thumb_cache = BoundedCache(MAX_THUMB_CACHE)
+thumb_cache = LRUCache(MAX_THUMB_CACHE)
 doc_cache   = LRUCache(MAX_DOC_CACHE)
 
 
 # ===================================================================
 # Helpers
 # ===================================================================
+
+# V5: Reusable retry wrapper for one-shot Telegram calls.
+# Catches FloodWait specifically, sleeps with jitter, retries up to
+# max_retries or max_total_wait — then re-raises so the caller's own
+# error handling takes over.
+async def _call_with_flood_retry(fn, *args, max_retries=3, max_total_wait=60, **kwargs):
+    """Retry a one-shot Telegram call on FloodWait with a hard ceiling."""
+    total_wait = 0.0
+    for attempt in range(max_retries + 1):
+        try:
+            return await fn(*args, **kwargs)
+        except FloodWait as e:
+            if attempt == max_retries or total_wait + e.value > max_total_wait:
+                raise
+            wait = e.value + 1  # +1s jitter
+            fn_name = getattr(fn, '__name__', str(fn))
+            log.warning(
+                f"FloodWait {e.value}s on {fn_name} "
+                f"(retry {attempt + 1}/{max_retries})"
+            )
+            await asyncio.sleep(wait)
+            total_wait += wait
+
+
 def validate_object_id(vid: str) -> ObjectId:
     try:
         return ObjectId(vid)
@@ -397,6 +419,25 @@ def _build_doc(message: Message) -> dict:
     }
 
 
+# T4: Pre-warm thumbnail cache at sync time so the first viewer doesn't
+# pay a live Telegram round-trip alongside a page-load burst.
+async def _prewarm_thumbnail(doc_id, thumb_file_id: str):
+    if not thumb_file_id:
+        return
+    try:
+        client = _get_thumb_client()
+        data = await asyncio.wait_for(
+            _call_with_flood_retry(client.download_media, thumb_file_id, in_memory=True),
+            timeout=10,
+        )
+        content = data.read() if hasattr(data, "read") else bytes(data)
+        if content:
+            await thumb_cache.set(str(doc_id), content)
+            log.debug(f"Thumbnail pre-warmed for {doc_id}")
+    except Exception as e:
+        log.warning(f"Thumbnail pre-warm failed for {doc_id}: {e}")
+
+
 async def _upsert_video(client: Client, message: Message):
     media = message.video or message.document
     if not media:
@@ -419,8 +460,9 @@ async def _upsert_video(client: Client, message: Message):
 
     doc = _build_doc(message)
 
+    # V5: retry resolve_peer on FloodWait
     try:
-        peer = await client.resolve_peer(message.chat.id)
+        peer = await _call_with_flood_retry(client.resolve_peer, message.chat.id)
         if hasattr(peer, "access_hash") and peer.access_hash:
             doc["channel_access_hash"] = peer.access_hash
             await _save_access_hash(message.chat.id, peer.access_hash)
@@ -436,6 +478,11 @@ async def _upsert_video(client: Client, message: Message):
         )
         if result.upserted_id:
             await doc_cache.invalidate(f"id:{result.upserted_id}")
+            # T4: fire-and-forget thumbnail pre-warm for new videos
+            if doc.get("thumb_file_id"):
+                asyncio.create_task(
+                    _prewarm_thumbnail(result.upserted_id, doc["thumb_file_id"])
+                )
         log.info(f"✅ Synced: {doc['title']} [{doc['type']}] genres={doc['genres']}")
     except Exception as e:
         log.error(f"❌ Failed to sync '{doc['title']}': {e}")
@@ -510,7 +557,10 @@ async def _cleanup_deleted_videos():
                 for i in range(0, len(msg_ids), 100):
                     batch = msg_ids[i:i+100]
                     try:
-                        msgs = await client.get_messages(ch_id, batch)
+                        # V5: retry get_messages on FloodWait
+                        msgs = await _call_with_flood_retry(
+                            client.get_messages, ch_id, batch
+                        )
                         existing_ids = {m.id for m in msgs if m and not getattr(m, "empty", False)}
                         deleted_ids = set(batch) - existing_ids
                         
@@ -555,7 +605,8 @@ async def _force_resolve_channels():
                 if client is None or not _clients_started.get(client_name):
                     continue
                 try:
-                    peer = await client.resolve_peer(channel_id)
+                    # V5: retry on FloodWait
+                    peer = await _call_with_flood_retry(client.resolve_peer, channel_id)
                     if hasattr(peer, "access_hash") and peer.access_hash:
                         await _save_access_hash(channel_id, peer.access_hash)
                         log.info(
@@ -575,7 +626,8 @@ async def _force_resolve_channels():
                 try:
                     await client.get_chat(channel_id)
                     try:
-                        peer = await client.resolve_peer(channel_id)
+                        # V5: retry on FloodWait
+                        peer = await _call_with_flood_retry(client.resolve_peer, channel_id)
                         if hasattr(peer, "access_hash") and peer.access_hash:
                             await _save_access_hash(channel_id, peer.access_hash)
                             log.info(f"  ✅ Resolved {channel_id} via {client_name} after get_chat")
@@ -616,7 +668,8 @@ async def _backfill_access_hashes():
                     if client is None or not _clients_started.get(client_name):
                         continue
                     try:
-                        peer = await client.resolve_peer(channel_id)
+                        # V5: retry on FloodWait
+                        peer = await _call_with_flood_retry(client.resolve_peer, channel_id)
                         if hasattr(peer, "access_hash") and peer.access_hash:
                             access_hash = peer.access_hash
                             break
@@ -647,6 +700,13 @@ async def lifespan(app: FastAPI):
 
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(_suppress_pyrogram_peer_errors)
+
+    # D3: Warn if PUBLIC_BASE_URL is not set
+    if not BASE_URL:
+        log.warning(
+            "PUBLIC_BASE_URL not set — thumb_url/stream_url will be relative; "
+            "frontend absoluteUrl() must prefix with a matching API_BASE_URL."
+        )
 
     bot_app = Client(
         "nexstream_bot",
@@ -734,6 +794,7 @@ class MediaAwareGZipMiddleware:
 web = FastAPI(lifespan=lifespan, docs_url="/docs", redoc_url=None)
 
 web.add_middleware(MediaAwareGZipMiddleware, minimum_size=1000)
+# D2: CORS origins now extensible via CORS_ORIGINS env var
 web.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -742,7 +803,7 @@ web.add_middleware(
         "https://nb-orwg.onrender.com",
         "https://obst.netlify.app",
         "https://obstr.netlify.app",
-    ],
+    ] + EXTRA_CORS_ORIGINS,
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
@@ -785,13 +846,16 @@ async def ensure_indexes():
         log.warning("Could not ensure indexes: %s", e)
 
 
+# T5: Removed stale thumb_url override — always recompute from base,
+# matching stream_url/download_url behavior. A leftover thumb_url field
+# on a Mongo doc could previously permanently override the fresh URL.
 def format_video_doc(d: dict) -> Optional[dict]:
     if d is None:
         return None
     d = dict(d)
     d["id"] = str(d.pop("_id"))
     base = BASE_URL or ""
-    d["thumb_url"] = d.get("thumb_url") or (
+    d["thumb_url"] = (
         f"{base}/api/thumb/{d['id']}" if d.get("thumb_file_id") else ""
     )
     if d.get("message_id") and d.get("file_unique_id"):
@@ -990,8 +1054,10 @@ async def _fetch_message_fresh(doc: dict):
     if not channel_id or not message_id:
         raise HTTPException(400, "Missing channel_id or message_id")
 
+    # Tier 1: direct get_messages
     try:
-        msg = await fetch_client.get_messages(channel_id, message_id)
+        # V5: retry on FloodWait
+        msg = await _call_with_flood_retry(fetch_client.get_messages, channel_id, message_id)
         if msg and not getattr(msg, "empty", False):
             return msg
     except PeerIdInvalid:
@@ -1003,6 +1069,7 @@ async def _fetch_message_fresh(doc: dict):
         else:
             log.error(f"get_messages failed (tier 1): {e}")
 
+    # Tier 2: get_chat to wake cache, then retry
     log.info(f"Tier 2: get_chat to wake cache for channel {channel_id}...")
     try:
         await fetch_client.get_chat(channel_id)
@@ -1012,12 +1079,14 @@ async def _fetch_message_fresh(doc: dict):
                 await _save_access_hash(channel_id, peer.access_hash)
         except Exception:
             pass
-        msg = await fetch_client.get_messages(channel_id, message_id)
+        # V5: retry on FloodWait
+        msg = await _call_with_flood_retry(fetch_client.get_messages, channel_id, message_id)
         if msg and not getattr(msg, "empty", False):
             return msg
     except Exception as e:
         log.warning(f"Tier 2 failed for channel {channel_id}: {e}")
 
+    # Tier 3: raw MTProto with stored access_hash
     access_hash = doc.get("channel_access_hash")
     if access_hash is None:
         access_hash = await _get_access_hash_from_db(channel_id)
@@ -1142,27 +1211,43 @@ async def build_stream_response(
     file_info = await _extract_file_info(msg)
     await _update_db_with_fresh_info(doc, msg, file_info)
 
-    client = _get_stream_client()
-    range_header = request.headers.get("range")
-    start, end = _parse_range(range_header, file_info["file_size"])
-    length = end - start + 1 if file_info["file_size"] > 0 else 0
-    chunk_offset = start // CHUNK_SIZE
-    discard = start % CHUNK_SIZE
-    
-    if length > 0:
-        chunk_limit = math.ceil((length + discard) / CHUNK_SIZE)
-    else:
-        chunk_limit = 0
+    # V2: Acquire semaphore BEFORE creating StreamingResponse so we can
+    # return a clean 503 with Retry-After instead of hanging indefinitely.
+    try:
+        await asyncio.wait_for(_stream_semaphore.acquire(), timeout=15)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            503,
+            "Server busy — too many concurrent streams",
+            headers={"Retry-After": "5"},
+        )
 
-    filename = custom_filename or file_info["file_name"]
-    if not filename:
-        title = doc.get("title", "download")
-        ext = get_file_extension(file_info["mime_type"])
-        filename = f"{sanitize_filename(title)}.{ext}"
-    else:
-        filename = sanitize_filename(filename)
+    # All setup that might raise must release the semaphore on failure.
+    try:
+        client = _get_stream_client()
+        range_header = request.headers.get("range")
+        start, end = _parse_range(range_header, file_info["file_size"])
+        length = end - start + 1 if file_info["file_size"] > 0 else 0
+        chunk_offset = start // CHUNK_SIZE
+        discard = start % CHUNK_SIZE
 
-    file_id = file_info["file_id"]
+        if length > 0:
+            chunk_limit = math.ceil((length + discard) / CHUNK_SIZE)
+        else:
+            chunk_limit = 0
+
+        filename = custom_filename or file_info["file_name"]
+        if not filename:
+            title = doc.get("title", "download")
+            ext = get_file_extension(file_info["mime_type"])
+            filename = f"{sanitize_filename(title)}.{ext}"
+        else:
+            filename = sanitize_filename(filename)
+
+        file_id = file_info["file_id"]
+    except Exception:
+        _stream_semaphore.release()
+        raise
 
     async def stream_generator():
         queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, READAHEAD_CHUNKS))
@@ -1173,6 +1258,30 @@ async def build_stream_response(
             "chunks_pulled": 0,
             "iterator": None,
         }
+
+        # V1/V5: Per-stream FloodWait retry budget
+        flood_state = {"retries": 0, "total_wait": 0.0}
+
+        async def _handle_flood_wait(e: FloodWait) -> bool:
+            """Returns True if we should retry, False if budget exhausted."""
+            flood_state["retries"] += 1
+            flood_state["total_wait"] += e.value
+            if (
+                flood_state["retries"] > FLOOD_MAX_RETRIES
+                or flood_state["total_wait"] > FLOOD_MAX_TOTAL_WAIT
+            ):
+                log.error(
+                    f"FloodWait budget exhausted "
+                    f"({flood_state['retries']} retries, "
+                    f"{flood_state['total_wait']:.0f}s) — giving up on this stream"
+                )
+                return False
+            log.warning(
+                f"FloodWait {e.value}s "
+                f"(retry {flood_state['retries']}/{FLOOD_MAX_RETRIES})"
+            )
+            await asyncio.sleep(e.value + 1)
+            return True
 
         async def _refresh_file_id() -> bool:
             try:
@@ -1206,6 +1315,12 @@ async def build_stream_response(
                                 await queue.put(None)
                                 return
                             continue
+                        except FloodWait as e:
+                            # V1: retry FloodWait instead of silently ending stream
+                            if not await _handle_flood_wait(e):
+                                await queue.put(None)
+                                return
+                            continue
                         except Exception as e:
                             log.error(f"Failed to start stream_media: {e}")
                             await queue.put(None)
@@ -1217,12 +1332,19 @@ async def build_stream_response(
                                 return
                             state["chunks_pulled"] += 1
                             await queue.put(chunk)
-                        
+
                         await queue.put(None)
                         return
                     except FileReferenceExpired:
                         state["iterator"] = None
                         if not await _refresh_file_id():
+                            await queue.put(None)
+                            return
+                        continue
+                    except FloodWait as e:
+                        # V1: retry FloodWait instead of silently ending stream
+                        state["iterator"] = None
+                        if not await _handle_flood_wait(e):
                             await queue.put(None)
                             return
                         continue
@@ -1257,48 +1379,63 @@ async def build_stream_response(
         watcher_task = None
 
         try:
-            async with _stream_semaphore:
-                producer_task = asyncio.create_task(producer())
-                watcher_task = asyncio.create_task(disconnect_watcher())
+            # V2: Semaphore already acquired in build_stream_response().
+            # Start producer and watcher immediately — no more async with.
+            producer_task = asyncio.create_task(producer())
+            watcher_task = asyncio.create_task(disconnect_watcher())
 
-                sent = 0
-                first_chunk = True
+            sent = 0
+            first_chunk = True
 
-                while not cancel_event.is_set():
-                    try:
-                        chunk = await asyncio.wait_for(queue.get(), timeout=60)
-                    except asyncio.TimeoutError:
-                        if producer_task.done() and queue.empty():
-                            log.warning("Producer finished & queue empty — ending stream")
-                            return
-                        if cancel_event.is_set():
-                            return
-                        continue
-                    except asyncio.CancelledError:
+            # V3: Wall-clock budget so a hung stream fails fast instead
+            # of looping every 60s forever.
+            deadline = asyncio.get_running_loop().time() + STREAM_WALL_CLOCK_BUDGET
+
+            while not cancel_event.is_set():
+                remaining_budget = deadline - asyncio.get_running_loop().time()
+                if remaining_budget <= 0:
+                    log.warning("Stream exceeded wall-clock budget — aborting")
+                    return
+
+                try:
+                    chunk = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=min(60, remaining_budget),
+                    )
+                except asyncio.TimeoutError:
+                    if producer_task.done() and queue.empty():
+                        log.warning("Producer finished & queue empty — ending stream")
                         return
-
-                    if chunk is None:
+                    if cancel_event.is_set():
                         return
+                    # V3: If the next 60s wait would exceed the deadline,
+                    # the budget check above will catch it on the next loop.
+                    continue
+                except asyncio.CancelledError:
+                    return
 
-                    if first_chunk and discard > 0:
-                        chunk = chunk[discard:]
-                    first_chunk = False
+                if chunk is None:
+                    return
 
-                    if not chunk:
-                        continue
+                if first_chunk and discard > 0:
+                    chunk = chunk[discard:]
+                first_chunk = False
 
-                    if length <= 0:
-                        yield chunk
-                        sent += len(chunk)
-                        continue
+                if not chunk:
+                    continue
 
-                    remaining = length - sent
-                    if len(chunk) >= remaining:
-                        yield chunk[:remaining]
-                        return
-
+                if length <= 0:
                     yield chunk
                     sent += len(chunk)
+                    continue
+
+                remaining = length - sent
+                if len(chunk) >= remaining:
+                    yield chunk[:remaining]
+                    return
+
+                yield chunk
+                sent += len(chunk)
 
         except ClientDisconnect:
             log.debug("Client disconnected (ClientDisconnect exception)")
@@ -1313,6 +1450,8 @@ async def build_stream_response(
                         await task
                     except (asyncio.CancelledError, Exception):
                         pass
+            # V2: Release the slot acquired in build_stream_response()
+            _stream_semaphore.release()
 
     headers = {
         "Accept-Ranges": "bytes",
@@ -1320,7 +1459,7 @@ async def build_stream_response(
     }
     if length > 0:
         headers["Content-Length"] = str(length)
-        
+
     quoted_filename = quote(filename)
     if force_download:
         headers["Content-Disposition"] = f"attachment; filename=\"{quoted_filename}\"; filename*=UTF-8''{quoted_filename}"
@@ -1482,7 +1621,7 @@ async def get_vlc_playlist(vid: str):
 
 
 # ===================================================================
-# THUMBNAILS (Optimized & Fixed)
+# THUMBNAILS (T1/T2: concurrency cap + timeouts)
 # ===================================================================
 @web.get("/api/thumb/{vid}")
 async def get_thumb(vid: str):
@@ -1491,7 +1630,7 @@ async def get_thumb(vid: str):
     except (InvalidId, TypeError):
         raise HTTPException(404, "Not found")
 
-    # 1. Check cache
+    # 1. Check cache (no semaphore needed for cache hits)
     cached = thumb_cache.get(vid)
     if cached:
         return Response(content=cached, media_type="image/jpeg")
@@ -1500,45 +1639,73 @@ async def get_thumb(vid: str):
     if not doc:
         raise HTTPException(404, "Not found")
 
-    # Select the best client (Prefers User Session)
-    client = _get_thumb_client()
-
-    # 2. Fast path: Try downloading using the stored thumb_file_id
-    thumb_file_id = doc.get("thumb_file_id")
-    if thumb_file_id:
-        try:
-            data = await client.download_media(thumb_file_id, in_memory=True)
-            if data:
-                content = data.read() if hasattr(data, 'read') else bytes(data)
-                if content:
-                    await thumb_cache.set(vid, content)
-                    return Response(content=content, media_type="image/jpeg")
-        except Exception as e:
-            log.warning(f"Thumbnail download via stored file_id failed: {e}")
-
-    # 3. Fallback: Fetch message fresh (handles PeerIdInvalid and FileReferenceExpired)
+    # T1: Acquire thumbnail concurrency slot with timeout
     try:
-        msg = await _fetch_message_fresh(doc)
-        media = msg.video or msg.document
-        if media and hasattr(media, 'thumbs') and media.thumbs:
-            # Pick the best/highest resolution thumbnail
-            best_thumb = max(media.thumbs, key=lambda t: t.width or 0)
-            
-            data = await client.download_media(best_thumb, in_memory=True)
-            if data:
-                content = data.read() if hasattr(data, 'read') else bytes(data)
-                if content:
-                    # Update DB with the fresh thumb_file_id so future requests are fast
-                    await videos_col.update_one(
-                        {"_id": doc["_id"]},
-                        {"$set": {"thumb_file_id": best_thumb.file_id}}
-                    )
-                    await thumb_cache.set(vid, content)
-                    return Response(content=content, media_type="image/jpeg")
-    except Exception as e:
-        log.error(f"Thumbnail fallback fetch failed: {e}")
+        await asyncio.wait_for(_thumb_semaphore.acquire(), timeout=8)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            503,
+            "Thumbnail service busy — too many concurrent requests",
+            headers={"Retry-After": "2"},
+        )
 
-    raise HTTPException(404, "No thumbnail available")
+    try:
+        client = _get_thumb_client()
+
+        # 2. Fast path: Try downloading using the stored thumb_file_id
+        # T2: timeout around download_media
+        # V5: retry on FloodWait
+        thumb_file_id = doc.get("thumb_file_id")
+        if thumb_file_id:
+            try:
+                data = await asyncio.wait_for(
+                    _call_with_flood_retry(
+                        client.download_media, thumb_file_id, in_memory=True
+                    ),
+                    timeout=10,
+                )
+                if data:
+                    content = data.read() if hasattr(data, 'read') else bytes(data)
+                    if content:
+                        await thumb_cache.set(vid, content)
+                        return Response(content=content, media_type="image/jpeg")
+            except asyncio.TimeoutError:
+                log.warning(f"Thumbnail download timed out for {vid}")
+            except Exception as e:
+                log.warning(f"Thumbnail download via stored file_id failed: {e}")
+
+        # 3. Fallback: Fetch message fresh (handles PeerIdInvalid and FileReferenceExpired)
+        # T2: timeout around _fetch_message_fresh and download_media
+        try:
+            msg = await asyncio.wait_for(_fetch_message_fresh(doc), timeout=15)
+            media = msg.video or msg.document
+            if media and hasattr(media, 'thumbs') and media.thumbs:
+                best_thumb = max(media.thumbs, key=lambda t: t.width or 0)
+
+                data = await asyncio.wait_for(
+                    _call_with_flood_retry(
+                        client.download_media, best_thumb, in_memory=True
+                    ),
+                    timeout=10,
+                )
+                if data:
+                    content = data.read() if hasattr(data, 'read') else bytes(data)
+                    if content:
+                        # Update DB with the fresh thumb_file_id so future requests are fast
+                        await videos_col.update_one(
+                            {"_id": doc["_id"]},
+                            {"$set": {"thumb_file_id": best_thumb.file_id}}
+                        )
+                        await thumb_cache.set(vid, content)
+                        return Response(content=content, media_type="image/jpeg")
+        except asyncio.TimeoutError:
+            log.warning(f"Thumbnail fallback fetch timed out for {vid}")
+        except Exception as e:
+            log.error(f"Thumbnail fallback fetch failed: {e}")
+
+        raise HTTPException(404, "No thumbnail available")
+    finally:
+        _thumb_semaphore.release()
 
 
 # ===================================================================
@@ -1643,6 +1810,10 @@ async def health():
             active = MAX_CONCURRENT_STREAMS - _stream_semaphore._value
         except Exception:
             active = -1
+        try:
+            active_thumbs = MAX_CONCURRENT_THUMBS - _thumb_semaphore._value
+        except Exception:
+            active_thumbs = -1
         return {
             "status": "ok",
             "videos": count,
@@ -1655,6 +1826,8 @@ async def health():
             },
             "active_streams": active,
             "max_streams": MAX_CONCURRENT_STREAMS,
+            "active_thumbs": active_thumbs,
+            "max_thumbs": MAX_CONCURRENT_THUMBS,
         }
     except Exception as e:
         return JSONResponse({"status": "degraded", "error": str(e)}, status_code=503)
@@ -1666,8 +1839,8 @@ async def favicon():
 
 
 # ===================================================================
-# Entrypoint
+# Entrypoint — fixed module name to match filename
 # ===================================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:web", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run("server:web", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
