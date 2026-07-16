@@ -723,7 +723,7 @@ async def lifespan(app: FastAPI):
         api_id=TELEGRAM_API_ID,
         api_hash=TELEGRAM_API_HASH,
         bot_token=BOT_TOKEN,
-        in_memory=True,
+        in_memory=False,
     )
     try:
         await bot_app.start()
@@ -743,7 +743,7 @@ async def lifespan(app: FastAPI):
             api_id=TELEGRAM_API_ID,
             api_hash=TELEGRAM_API_HASH,
             session_string=SESSION_STRING,
-            in_memory=True,
+            in_memory=False,
         )
         try:
             await stream_client.start()
